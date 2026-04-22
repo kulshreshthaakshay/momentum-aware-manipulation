@@ -682,15 +682,16 @@ class TrussAssemblyEnv(gym.Env):
         gripper_cmd = float(action[-1])
         
         # Differentiated fuel penalties: RCS thrusters (expendable) vs electric joints (renewable)
-        rcs_penalty = 0.005 * np.sum(np.abs(action[:6]))     # Base thrust + torque (expendable fuel)
-        joint_penalty = 0.0005 * np.sum(np.abs(action[6:]))  # Arm joints + gripper (electric)
+        rcs_penalty = 0.05 * np.sum(np.abs(action[:6]))     # Base thrust + torque (expendable fuel)
+        joint_penalty = 0.005 * np.sum(np.abs(action[6:]))  # Arm joints + gripper (electric)
         fuel_penalty = rcs_penalty + joint_penalty
         
         # Fix 2.3: Compute H_sys ONCE and cache — avoid O(N²) duplicate calls
         H_sys = self._cached_H_sys
         H_sys_norm = self._cached_H_sys_norm
         info["H_sys_norm"] = H_sys_norm
-        momentum_penalty = 0.01 * H_sys_norm
+        # Scale coherence fix: Boost momentum penalty to 0.1
+        momentum_penalty = 0.1 * H_sys_norm
         # H_sys_norm is now available for all stage blocks below (no re-computation)
         
         # Joint limit proximity penalty (smooth activation near URDF limits)
