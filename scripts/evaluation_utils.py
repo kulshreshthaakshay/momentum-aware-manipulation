@@ -203,8 +203,6 @@ def evaluate_policy_metrics(
             # Loop ended without break
             lengths.append(max_steps)
             timeouts += 1
-            timeouts += 1
-            lengths.append(env.max_steps)
 
         rewards.append(episode_reward)
         max_momenta.append(max_h)
