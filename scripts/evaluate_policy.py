@@ -19,7 +19,8 @@ def evaluate(args):
     print(f"Environment Stage: {args.stage}")
     
     # Create env
-    env = TrussAssemblyEnv(render_mode="rgb_array", curriculum_stage=args.stage, control_mode=args.control_mode)
+    raw_env = TrussAssemblyEnv(render_mode="rgb_array", curriculum_stage=args.stage, control_mode=args.control_mode)
+    env = raw_env
     
     # Load model
     if "ppo" in args.model_path.lower():
@@ -57,7 +58,12 @@ def evaluate(args):
         best_episode_reward = -np.inf
         best_episode_frames = []
         for i in range(min(n_episodes, 5)):  # Limit GIF candidates to 5
-            obs, info = env.reset()
+            reset_res = env.reset()
+            if isinstance(reset_res, tuple):
+                obs, _ = reset_res
+            else:
+                obs = reset_res
+            
             done = False
             truncated = False
             episode_reward = 0
@@ -65,9 +71,22 @@ def evaluate(args):
             
             while not (done or truncated):
                 action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, truncated, info = env.step(action)
+                step_res = env.step(action)
+                
+                # Handle VecEnv vs Gym Env return signature
+                if len(step_res) == 5:
+                    obs, reward, done, truncated, info = step_res
+                else:
+                    obs, reward, done, info = step_res
+                    truncated = done # VecEnv combines them
+                    info = info[0] # VecEnv returns list of dicts
+                    reward = reward[0]
+                    done = done[0]
+                    truncated = truncated[0]
+                
                 episode_reward += reward
-                frame = env.render()
+                # Use raw_env for rendering to bypass VecNormalize wrapper
+                frame = raw_env.render()
                 frames.append(frame)
             
             if episode_reward > best_episode_reward:
