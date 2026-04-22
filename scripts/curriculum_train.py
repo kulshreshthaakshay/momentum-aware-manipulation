@@ -249,9 +249,17 @@ def run_curriculum(
             # Transfer to new environment
             print("\n  Transferring model to new stage...")
             
-            # Critical-2: Carry forward normalization stats
-            old_obs_rms = train_env.obs_rms
-            # Re-wrap or reset stats as needed, but here we just update the model's env
+            # Critical-2: Carry forward normalization stats from previous stage
+            prev_stats_path = f"{save_dir}/stage{stage-1}_final_vecnorm.pkl"
+            if os.path.exists(prev_stats_path):
+                print(f"  Carrying normalization stats from stage {stage-1}")
+                # Load stats and copy into the new wrapper
+                old_vn = VecNormalize.load(prev_stats_path, train_env)
+                train_env.obs_rms = old_vn.obs_rms
+                train_env.ret_rms = old_vn.ret_rms
+            else:
+                print(f"  Warning: No stats found for stage {stage-1}. Starting fresh.")
+            
             model.set_env(train_env)
             
             # Critical-1: Update gamma for the new stage
