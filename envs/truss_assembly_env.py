@@ -684,7 +684,16 @@ class TrussAssemblyEnv(gym.Env):
         
         # Differentiated fuel penalties: RCS thrusters (expendable) vs electric joints (renewable)
         rcs_penalty = 0.05 * np.sum(np.abs(action[:6]))     # Base thrust + torque (expendable fuel)
-        joint_penalty = 0.005 * np.sum(np.abs(action[6:]))  # Arm joints + gripper (electric)
+        
+        if self.control_mode == "task_space":
+            # Significant-16: Separate scaling for EE linear vs angular control effort
+            ee_lin_penalty = 0.01 * np.sum(np.abs(action[6:9]))   # 3D Linear
+            ee_ang_penalty = 0.005 * np.sum(np.abs(action[9:12])) # 3D Angular
+            grip_penalty = 0.002 * np.abs(action[12])
+            joint_penalty = ee_lin_penalty + ee_ang_penalty + grip_penalty
+        else:
+            joint_penalty = 0.005 * np.sum(np.abs(action[6:]))  # Arm joints + gripper (electric)
+            
         fuel_penalty = rcs_penalty + joint_penalty
         
         # Fix 2.3: Compute H_sys ONCE and cache — avoid O(N²) duplicate calls
