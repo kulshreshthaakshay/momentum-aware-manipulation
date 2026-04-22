@@ -1,485 +1,352 @@
-# Zero-G Assembly RL — Fix Validation & Remaining Issues Report
+# Zero-G Assembly RL — Final Validation Report (Round 3)
 
 ## Score Card
 
 | Category | Count |
 |---|---|
-| ✅ Confirmed Fixed | 23 |
-| 🔴 New Bugs Introduced | 3 |
-| 🔴 Remaining (partial fix) | 5 |
-| ⚠️ Design / Performance | 5 |
-| ⚠️ Minor / Cosmetic | 5 |
+| ✅ Confirmed Correct | 21 |
+| 🔴 Bugs (will crash or corrupt training) | 7 |
+| ⚠️ Warnings (degrade quality silently) | 2 |
 
 ---
 
-## ✅ Confirmed Fixed (23)
+## 🔴 Bug 1 — CRASH: `physicsClientId` Passed to Pure Math Functions
 
-All 18 issues from the previous review were addressed. The following are confirmed
-correct by line-by-line inspection:
+**File:** `envs/truss_assembly_env.py` — `_handle_gripper()` and `_compute_system_angular_momentum()`
 
-| Fix | Verdict |
-|-----|---------|
-| 1.1 Jacobian column slice `[:, :7]` | ✅ Correct |
-| 1.2 COM velocity `frame_vel + ω × r` | ✅ Correct |
-| 1.3 `assert physics_client >= 0` | ✅ Correct |
-| 1.3 `setGravity/setTimeStep` pass `physicsClientId` | ✅ Correct |
-| 2.1 Stage 3 requires `grasp_hold_steps >= 5` | ✅ Correct |
-| 2.2 Progress reward clipped `max(0.0, ...)` both Stage 4 & 5 | ✅ Correct |
-| 2.3 `H_sys` computed once at top of `_compute_reward` | ✅ Correct |
-| 2.4 Station keeping escalating reward + 20-step success gate | ✅ Correct |
-| 3.1 Absolute `robot_pos` zeroed in observation | ✅ Correct |
-| 4.1 `success_threshold` reduced to 0.95–0.75 per stage | ✅ Correct |
-| 4.2 LR update forces Adam `param_groups['lr']` | ✅ Correct |
-| 4.3 `SuccessRateCallback` single condition, no double-count | ✅ Correct |
-| 4.4 `deterministic=False` for Stages 1–3 | ✅ Correct |
-| 4.5 Buffer size divisibility assert added | ✅ Correct |
-| 5.1 Right finger URDF changed to `type="prismatic"` | ✅ Correct |
-| 5.2 `ee_link_idx = 7` (finger_left) | ✅ Correct |
-| 6.2 `prev_dist_to_goal` reset at grasp transition in Stage 4 | ✅ Correct |
-| 7.1 `evaluate_policy.py` single rollout loop | ✅ Correct |
-| 7.2 `timeouts` counter moved to reachable branch | ✅ Correct |
-
----
-
-## 🔴 New Bugs Introduced (3)
-
-### BUG-1: Right Finger Won't Open — Sign Error After URDF Fix
-
-**File:** `envs/truss_assembly_env.py` — `_handle_gripper()`
-
-The URDF fix changed `gripper_joint_right` to `type="prismatic"` with axis `xyz="0 -1 0"`
-and joint limits `lower=0.0, upper=0.03`. The axis is already mirrored to make the finger
-close inward. However `_handle_gripper()` was not updated:
+When adding `physicsClientId` everywhere, it was also applied to PyBullet utility
+functions that are pure math operations with **no physics client context**. These
+will raise `TypeError` at runtime immediately:
 
 ```python
-p.setJointMotorControl2(
-    self.robot_id, self.gripper_indices[1],
-    controlMode=p.POSITION_CONTROL,
-    targetPosition=-target_pos,   # ← sends -0.03 when open, but lower limit = 0.0
-    force=10
-)
+# _handle_gripper() — WILL CRASH:
+ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn,
+                                            physicsClientId=self.physics_client)  # ← TypeError
+local_pos, local_orn = p.multiplyTransforms(...,
+                                            physicsClientId=self.physics_client)  # ← TypeError
+
+# _compute_system_angular_momentum() — WILL CRASH every call:
+R_link = np.array(p.getMatrixFromQuaternion(orn,
+                   physicsClientId=self.physics_client)).reshape(3, 3)  # ← TypeError
+R_inertial = np.array(p.getMatrixFromQuaternion(local_inertial_orn,
+                       physicsClientId=self.physics_client)).reshape(3, 3)  # ← TypeError
 ```
 
-`target_pos = 0.03` when open. Sending `targetPosition = -0.03` violates the joint
-limit `lower=0.0`. PyBullet clamps to 0.0, so the right finger stays closed regardless
-of the open command. The gripper cannot open.
+`p.invertTransform`, `p.multiplyTransforms`, and `p.getMatrixFromQuaternion` are
+stateless math utilities. They do not interact with any physics simulation.
+PyBullet's C binding will immediately raise `TypeError: unexpected keyword argument
+'physicsClientId'`.
 
-**Fix:**
+**Fix — remove `physicsClientId` from exactly these calls:**
 ```python
-# Since axis is already mirrored (0 -1 0), send the SAME positive target
-p.setJointMotorControl2(
-    self.robot_id, self.gripper_indices[1],
-    controlMode=p.POSITION_CONTROL,
-    targetPosition=target_pos,   # NOT negated — axis handles the direction
-    force=10
-)
+# _handle_gripper():
+ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn)
+local_pos, local_orn = p.multiplyTransforms(ee_inv_pos, ee_inv_orn,
+                                             list(part_pos), list(part_orn))
+
+# _compute_system_angular_momentum():
+R_link = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)
+R_inertial = np.array(p.getMatrixFromQuaternion(local_inertial_orn)).reshape(3, 3)
 ```
 
 ---
 
-### BUG-2: Jacobian Computed 5× Per Policy Step — Still Broken for Performance
+## 🔴 Bug 2 — Two Remaining `p.*` Calls Missing `physicsClientId`
 
-**File:** `envs/truss_assembly_env.py` — `step()`, task-space branch
+**File:** `envs/truss_assembly_env.py`
 
-The column slicing was fixed (✅), but the Jacobian computation itself remains
-**inside the substep loop**:
+After the broad `physicsClientId` sweep, two calls were missed:
 
+**In `_handle_gripper()`:**
 ```python
-for _ in range(self.sim_substeps):          # loops 5 times
-    p.applyExternalForce(...)
-    if self.control_mode == "task_space":
-        movable_indices = []                # rebuilt each substep!
-        for i in range(num_joints):
-            j_info = p.getJointInfo(...)    # O(N) each substep
-            ...
-        linear_jacobian, angular_jacobian = p.calculateJacobian(...)  # expensive
-        J = np.vstack([...])
-        J_pinv = J.T @ np.linalg.inv(...)  # matrix inverse each substep
-        target_joint_vels = J_pinv @ x_dot_desired + null_projector @ ...
-        p.setJointMotorControlArray(...)
-    p.stepSimulation()
+ee_state = p.getLinkState(self.robot_id, self.ee_link_idx)  # ← missing physicsClientId
 ```
 
-Each policy step recomputes: 5 × `getJointInfo` loops + 5 × Jacobian + 5 × matrix
-inverse + 5 × null-space projection. With 8 parallel envs, this is 40 full Jacobian
-inversions per policy step. The Jacobian barely changes over 5 × (1/240 s) substeps
-and should be computed once before the loop.
-
-**Fix:**
+**In `_compute_reward()`:**
 ```python
-# --- COMPUTE ONCE BEFORE SUBSTEP LOOP ---
-J = None
-if self.control_mode == "task_space":
-    joint_states = p.getJointStates(self.robot_id, self._movable_indices)  # cached
-    q_movable = [s[0] for s in joint_states]
-    dq_movable = [s[1] for s in joint_states]
-    zero_acc = [0.0] * len(self._movable_indices)
-    
-    lin_jac, ang_jac = p.calculateJacobian(
-        self.robot_id, self.ee_link_idx, [0, 0, 0],
-        q_movable, dq_movable, zero_acc
-    )
-    lin_jac = np.array(lin_jac)[:, :len(self.arm_indices)]
-    ang_jac = np.array(ang_jac)[:, :len(self.arm_indices)]
-    J = np.vstack([lin_jac, ang_jac])
-    
-    lambda_val = 0.05
-    J_pinv = J.T @ np.linalg.inv(J @ J.T + lambda_val**2 * np.eye(6))
-    dq_arm = np.array([s[1] for s in p.getJointStates(self.robot_id, self.arm_indices)])
-    null_projector = np.eye(7) - J_pinv @ J
-    target_joint_vels = J_pinv @ arm_vel + null_projector @ (-0.5 * dq_arm)
-    p.setJointMotorControlArray(self.robot_id, self.arm_indices,
-                                controlMode=p.VELOCITY_CONTROL,
-                                targetVelocities=target_joint_vels, forces=[100]*7)
-
-# --- SUBSTEP LOOP (physics only, no recomputation) ---
-for _ in range(self.sim_substeps):
-    p.applyExternalForce(self.robot_id, -1, thrust.tolist(), [0,0,0], p.LINK_FRAME)
-    p.applyExternalTorque(self.robot_id, -1, torque.tolist(), p.LINK_FRAME)
-    p.stepSimulation()
-```
-
-Also: cache `_movable_indices` in `_create_robot()` instead of rebuilding with
-`getJointInfo` every call.
-
----
-
-### BUG-3: `continue_training.py` — LR Update Doesn't Reach Adam Optimizer
-
-**File:** `scripts/continue_training.py`
-
-Fix 4.2 correctly updated `curriculum_train.py` to patch `param_groups`, but
-`continue_training.py` still has the original broken pattern:
-
-```python
-if learning_rate:
-    print(f"Adjusting learning rate: {model.learning_rate} → {learning_rate}")
-    model.learning_rate = learning_rate    # ← silently ignored by Adam
+joint_states_for_limits = p.getJointStates(self.robot_id, self.arm_indices)  # ← missing
 ```
 
 **Fix:**
 ```python
-if learning_rate:
-    model.learning_rate = learning_rate
-    for param_group in model.policy.optimizer.param_groups:
-        param_group['lr'] = learning_rate
-    print(f"Learning rate updated to {learning_rate}")
+# _handle_gripper():
+ee_state = p.getLinkState(self.robot_id, self.ee_link_idx,
+                           physicsClientId=self.physics_client)
+
+# _compute_reward():
+joint_states_for_limits = p.getJointStates(self.robot_id, self.arm_indices,
+                                            physicsClientId=self.physics_client)
 ```
 
 ---
 
-## 🔴 Remaining from Previous Review (5)
+## 🔴 Bug 3 — Stale `_get_obs()` Docstring (Shape Mismatch Documentation)
 
-### REMAINING-1: `physicsClientId` Not Passed in Most PyBullet Calls
+**File:** `envs/truss_assembly_env.py` — `_get_obs()` docstring
 
-**Files:** `_create_robot()`, `_handle_gripper()`, `_get_obs()`, `step()`
-
-The fix only added `physicsClientId` to 3 lines in `reset()`. The vast majority of
-PyBullet calls throughout the class still lack it:
-
-| Method | Missing physicsClientId Calls |
-|--------|-------------------------------|
-| `_create_robot()` | `p.loadURDF`, `p.resetJointState` (×7), `p.setJointMotorControlArray`, `p.changeDynamics` (×N), `p.getNumJoints`, `p.getJointInfo` (×7) |
-| `_handle_gripper()` | `p.setJointMotorControl2` (×2), `p.getLinkState`, `p.getBasePositionAndOrientation`, `p.invertTransform`, `p.multiplyTransforms`, `p.createConstraint`, `p.removeConstraint` |
-| `_get_obs()` | `p.getBasePositionAndOrientation`, `p.getBaseVelocity`, `p.getJointStates`, `p.getLinkState`, `p.getContactPoints` |
-| `step()` | `p.applyExternalForce`, `p.applyExternalTorque`, `p.setJointMotorControlArray`, `p.getNumJoints`, `p.getJointInfo`, `p.getJointStates`, `p.calculateJacobian`, `p.getLinkState`, `p.stepSimulation`, `p.getBasePositionAndOrientation` |
-| `_compute_reward()` | `p.getBasePositionAndOrientation`, `p.getBaseVelocity`, `p.getLinkState`, `p.getJointStates` |
-| `render()` | `p.computeViewMatrix`, `p.computeProjectionMatrixFOV`, `p.getCameraImage` |
-
-With `SubprocVecEnv`, each worker runs in a separate process and gets its own PyBullet
-client ID (typically 0 in every subprocess). So cross-contamination through wrong IDs
-is actually unlikely in `SubprocVecEnv` because each process is isolated. However the
-assert and explicit ID passing are important for the `DummyVecEnv` case (single
-process, multiple clients) and for correctness in the `human` render mode where a GUI
-client exists alongside training clients.
-
-**Pragmatic approach:** Since `SubprocVecEnv` uses separate processes (safe), the
-immediate risk is lower than originally stated. But for correctness and to support
-`DummyVecEnv`, pass `physicsClientId=self.physics_client` everywhere. The easiest
-pattern: store `self.pc = self.physics_client` and use `physicsClientId=self.pc`.
-
----
-
-### REMAINING-2: `_compute_system_angular_momentum` Called in Both `_get_obs` and `_compute_reward`
-
-`_get_obs()` calls `_compute_system_angular_momentum()` to fill the H_sys observation
-fields. `_compute_reward()` now calls it once (fixed). But in `step()`:
+The docstring was never updated after removing `robot_pos (3)` and `base_to_ee (3)`:
 
 ```python
-obs = self._get_obs()           # calls _compute_system_angular_momentum() → CALL 1
-reward, info = self._compute_reward(action)  # calls it again → CALL 2
-```
-
-Total: 2 O(N²) computations per policy step. The fix cached within `_compute_reward`
-but didn't address the `_get_obs` call.
-
-**Fix:** Compute H_sys once at the start of `step()`, cache as `self._cached_H_sys`,
-and have both `_get_obs()` and `_compute_reward()` read from the cache:
-
-```python
-def step(self, action):
+def _get_obs(self):
+    """
+    Robot: pos(3), orn(4), lin_vel(3), ang_vel(3) = 13   ← WRONG (pos removed → 10)
+    Arm: joint_pos(7), joint_vel(7) = 14
+    Relative: ee_to_part(3), part_to_goal(3), base_to_ee(3) = 9  ← WRONG (base_to_ee removed → 6)
     ...
-    # Substep loop
-    for _ in range(self.sim_substeps):
-        ...
-        p.stepSimulation()
-    
-    # Compute once, share between obs and reward
-    self._cached_H_sys = self._compute_system_angular_momentum()
-    self._cached_H_sys_norm = np.linalg.norm(self._cached_H_sys)
-    
-    obs = self._get_obs()              # reads self._cached_H_sys
-    reward, info = self._compute_reward(action)  # reads self._cached_H_sys_norm
+    Total = 13 + 14 + 9 + 1 + 3 + 2 + 4 = 46             ← WRONG (actual = 40)
+    """
+```
+
+The `observation_space` correctly declares `shape=(40,)`, so training won't crash, but the
+docstring actively misleads anyone reading the code. It's especially dangerous because
+`evaluation_utils.py` hardcodes obs indices — any contributor who trusts the docstring
+to add a new field will get the indices wrong.
+
+**Fix — update docstring to match reality:**
+```python
+"""
+Robot (10): orn(4), lin_vel(3), ang_vel(3)
+Arm   (14): joint_pos(7), joint_vel(7)
+Relative(6): ee_to_part(3), part_to_goal(3)
+Gripper (1): gripper_state(1)
+Contact (3): contact_force(3)
+Dist    (2): dist_to_part(1), dist_to_goal(1)
+Momentum(4): H_sys(3), ||H_sys||(1)
+Total = 10 + 14 + 6 + 1 + 3 + 2 + 4 = 40
+"""
 ```
 
 ---
 
-## ⚠️ Design Issues (5)
+## 🔴 Bug 4 — Stage 4: `grasp_hold_steps` Never Reset on Gripper Open
 
-### DESIGN-1: Curriculum Advancement on Single Evaluation — High Variance
+**File:** `envs/truss_assembly_env.py` — `_compute_reward()`, Stage 4
 
-Even with fixed thresholds (0.95→0.75), advancement is checked after a single
-50-episode evaluation. Variance at 50 episodes: σ ≈ √(p(1−p)/50) ≈ 3% at p=0.9.
-One unlucky batch can block advancement; one lucky batch can advance prematurely.
-
-**Fix:** Require threshold to be met in 2 consecutive evaluations:
+When the agent is in Stage 4 transport phase and opens the gripper (dropping the part),
+the code enters the `if not self.gripper_closed` approach branch. That branch never
+resets `grasp_hold_steps`. If the agent then re-closes the gripper, the hold counter
+continues from where it left off — so a non-consecutive grasp pattern triggers the
+milestone:
 
 ```python
-consecutive_threshold_met = 0
-while total_trained < config['max_timesteps']:
+# Stage 4 approach branch — gripper OPEN:
+if not self.gripper_closed:
+    progress = self.prev_dist_to_part - dist_to_part
+    reward += 50.0 * progress
     ...
-    if success_rate >= config['success_threshold'] and total_trained >= config['min_timesteps']:
-        consecutive_threshold_met += 1
-        if consecutive_threshold_met >= 2:
-            print(f"✅ Stage {stage} COMPLETE!")
-            break
-    else:
-        consecutive_threshold_met = 0
+    self.prev_dist_to_part = dist_to_part
+    # grasp_hold_steps is NEVER reset here!
+
+# Stage 4 transport branch — gripper CLOSED:
+else:
+    self.grasp_hold_steps += 1
+    if not self.milestone_first_grasp and self.grasp_hold_steps >= 3:
+        reward += 200.0   # ← fires on accumulated, non-consecutive count
 ```
 
----
-
-### DESIGN-2: Gripper Constraint Created After Substep Loop — Physics Snap
-
-`_handle_gripper()` is called after the 5-substep physics loop. On the step where
-the agent first closes the gripper within `grasp_distance`, the 5 substeps run with
-the part free-floating, then the constraint is created. On the next step, the
-constraint is active during substeps. If the part drifted during those 5 unconstrained
-substeps, the constraint creation at a different relative pose causes a visible snap.
-The existing `parentFramePosition` / `localPos` computation at grasp time mitigates
-this, but the 5-substep drift remains.
-
-This is a known limitation of the constraint-injection approach. For high fidelity,
-move `_handle_gripper()` inside the substep loop (called once, before `stepSimulation`).
-
----
-
-### DESIGN-3: Stage 4/5 Instant Grasp Milestone — Inconsistent with Stage 3 Hold
-
-Stage 3 now requires 5 consecutive steps of `gripper_closed`. But in Stages 4 and 5,
-`milestone_first_grasp` fires on the **first** step where `gripper_closed=True`, with
-no hold requirement. This creates an inconsistency: the agent learns persistent grasping
-in Stage 3 but not in Stages 4/5. If the agent briefly closes the gripper and opens it
-in Stage 4 (accidentally), it receives a 200-point milestone bonus and no subsequent
-transport incentive.
-
-**Fix:** Apply a 3-step hold requirement to the Stage 4/5 milestone as well (lower
-than Stage 3's 5-step requirement since the goal is transport, not grasp precision).
-
----
-
-### DESIGN-4: `H_sys_norm` in Monitor — Records Last-Step Value, Not Episode Max
-
+**Fix:**
 ```python
-return Monitor(
-    env,
-    info_keywords=("success", "dropped_early", "H_sys_norm", ...),
-)
-```
-
-`Monitor` captures `info` at episode end (the last `step()` info dict). `H_sys_norm`
-at episode end is typically near zero (agent has stopped). The peak momentum during
-transport is what matters for research but will never appear in TensorBoard logs.
-
-**Fix:** Track `max_H_sys_norm` as a running episode maximum in a custom callback
-or expose it via an episodic info wrapper:
-
-```python
-class MomentumMonitor(gym.Wrapper):
-    def reset(self, **kwargs):
-        self._max_h = 0.0
-        return super().reset(**kwargs)
-    
-    def step(self, action):
-        obs, reward, terminated, truncated, info = super().step(action)
-        self._max_h = max(self._max_h, info.get("H_sys_norm", 0.0))
-        if terminated or truncated:
-            info["max_H_sys_norm"] = self._max_h
-        return obs, reward, terminated, truncated, info
-```
-
----
-
-### DESIGN-5: `movable_indices` Rebuilt Every Substep in Task-Space Mode
-
-(See BUG-2 above for full context.) Even after moving the Jacobian out of the loop,
-`movable_indices` is rebuilt via a `p.getJointInfo` loop every call. Cache it:
-
-```python
-def _create_robot(self):
+if not self.gripper_closed:
+    self.grasp_hold_steps = 0   # ← add this
+    progress = self.prev_dist_to_part - dist_to_part
     ...
-    # Cache movable joint indices (excludes FIXED joints like gripper_joint_right was)
-    self._movable_indices = []
-    for i in range(p.getNumJoints(self.robot_id)):
-        if p.getJointInfo(self.robot_id, i)[2] != p.JOINT_FIXED:
-            self._movable_indices.append(i)
-    # After fix 5.1: both finger joints are prismatic → movable. 
-    # _movable_indices = [0,1,2,3,4,5,6,7,8] (7 arm + 2 gripper)
-    # For Jacobian, we only want arm joints: first 7.
 ```
 
 ---
 
-## ⚠️ Minor Issues (5)
+## 🔴 Bug 5 — Stage 5 Re-grasp: `prev_dist_to_goal` Not Reset
 
-### MINOR-1: `R_link_tmp` Redundant Recompute in `add_body_link`
+**File:** `envs/truss_assembly_env.py` — `_compute_reward()`, Stage 5
 
-In `_compute_system_angular_momentum()`, the corrected code computes:
+The attempt to fix this (Minor-4) used the wrong condition:
 
 ```python
-R_link_tmp = np.array(p.getMatrixFromQuaternion(link_state[5])).reshape(3, 3)
-r_offset = R_link_tmp @ local_inertial_pos
-vel = frame_vel + np.cross(np.array(omega), r_offset)
+# Current fix attempt:
+if self.grasped_part and self.gripper_closed and not was_grasped_before:
+    self.prev_dist_to_goal = dist_part_to_goal
 ```
 
-Then 6 lines later:
+On a **re-grasp** scenario (grasp → release → re-grasp), when re-grasping:
+- `was_grasped_before = self.grasped_part = True` (latched from first grasp)
+- `not was_grasped_before = False`
+- Condition fails → `prev_dist_to_goal` is NOT reset
+
+The correct approach is to track the gripper state transition explicitly:
+
 ```python
-R_link = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)   # orn = link_state[5]
-```
+# In reset():
+self._prev_gripper_closed = False
 
-Same quaternion, same matrix, computed twice. Replace `R_link_tmp` with `R_link` and
-reorder so `R_link` is computed first.
+# In _compute_reward(), Stage 5, at the top of the stage block:
+gripper_just_closed = self.gripper_closed and not self._prev_gripper_closed
+if gripper_just_closed and self.grasped_part:
+    self.prev_dist_to_goal = dist_part_to_goal   # reset on every grasp transition
+
+# At the end of _compute_reward():
+self._prev_gripper_closed = self.gripper_closed
+```
 
 ---
 
-### MINOR-2: `ee_vel` in Reward Uses Link Frame Velocity
+## 🔴 Bug 6 — Dead Computation in `_get_obs()`
+
+**File:** `envs/truss_assembly_env.py` — `_get_obs()`
+
+`base_to_ee` and `robot_pos_arr` are computed but never used in the observation:
 
 ```python
-ee_state = p.getLinkState(self.robot_id, self.ee_link_idx, computeLinkVelocity=1)
-ee_pos = np.array(ee_state[0])
-ee_vel = np.array(ee_state[6])   # link FRAME velocity, not COM velocity
+robot_pos_arr = np.array(robot_pos)      # ← fetched but only used for base_to_ee
+ee_to_part = part_pos - ee_pos           # used ✓
+part_to_goal = goal_pos - part_pos       # used ✓
+base_to_ee = ee_pos - robot_pos_arr      # ← computed but NOT in obs array
 ```
 
-After Fix 5.2, `ee_link_idx=7` is `finger_left`, which has a tiny mass (0.05 kg) and
-minimal inertia offset. The velocity error is negligible in practice (< 1 mm/s for
-typical arm speeds), but for physical correctness, apply the same correction as in
-`_compute_system_angular_momentum`.
+The `obs` array no longer includes `base_to_ee`. This is dead code that wastes
+one array allocation per step. It also signals incomplete cleanup.
+
+**Fix:** Remove these two lines entirely:
+```python
+# DELETE:
+robot_pos_arr = np.array(robot_pos)
+base_to_ee = ee_pos - robot_pos_arr
+```
 
 ---
 
-### MINOR-3: Stage 2 Dead Outer Condition
+## 🔴 Bug 7 — Stage 1 Escalating Reward Spike Disrupts PPO Value Estimates
+
+**File:** `envs/truss_assembly_env.py` — `_compute_reward()`, Stage 1
+
+The escalating station-keeping reward creates an extreme per-step spike:
 
 ```python
-if dist_to_part < 0.2:           # outer check
-    if dist_to_part < self.grasp_distance:   # grasp_distance=0.25 > 0.2 → always True here
-        reward += 200.0
+if dist_from_origin < 0.1 and vel_magnitude < 0.1:
+    self.station_keeping_steps += 1
+    reward += 2.0 * self.station_keeping_steps   # step 20: +40
+    if self.station_keeping_steps >= 20:
+        reward += 200.0   # +200 at step 20 → total spike ~241 in ONE step
+```
+
+Normal per-step reward is ~0 to ~1. A single step with reward ~241 will cause the
+GAE advantage estimate to spike catastrophically. PPO's clipping is on the policy
+ratio, not on reward magnitude — PPO has no built-in protection against this.
+The value network will be unable to predict this value, causing large gradient
+updates and policy degradation ("reward hacking" or collapse).
+
+**Fix — cap the escalating component and separate the terminal bonus:**
+```python
+if dist_from_origin < 0.1 and vel_magnitude < 0.1:
+    self.station_keeping_steps += 1
+    # Capped escalating reward: max +5/step at N=5+
+    reward += min(1.0 * self.station_keeping_steps, 5.0)
+    if self.station_keeping_steps >= 20:
+        reward += 50.0   # Reduced but still significant success bonus
         info["success"] = True
 ```
 
-The outer `if dist_to_part < 0.2` is always satisfied when the inner check triggers.
-The intent was probably to keep the stricter 0.2m criterion from the original code but
-this was left as dead nesting. Clean up to:
-
-```python
-if dist_to_part < self.grasp_distance:
-    reward += 200.0
-    info["success"] = True
-```
+Alternatively, normalize all stage rewards to the same scale (~0 to ~5/step) as a
+general principle across all stages. Currently Stage 3 has a +200 milestone bonus
+and Stage 5 has a +600 terminal bonus — these are very large relative to the
+continuous shaping signals.
 
 ---
 
-### MINOR-4: Stage 5 Re-grasp `prev_dist_to_goal` Not Reset
+## ⚠️ Warning 1 — `base_to_ee` and `robot_pos_arr` Are Dead Variables
 
-If the agent grasps (Phase 1 → Phase 2), then releases early (Phase 3, `dropped_early`),
-then re-grasps in a subsequent step, `milestone_first_grasp=True` means the milestone
-block is skipped, and `prev_dist_to_goal` is **not** reset to the current distance.
-Phase 2 resumes with a stale `prev_dist_to_goal`, producing a large spurious progress
-reward on the first transport step.
-
-**Fix:** Reset `prev_dist_to_goal` whenever the gripper transitions from open to closed
-while `grasped_part=True` (re-grasp):
-
-```python
-# In Step 5 phase logic, detect re-grasp:
-if self.grasped_part and self.gripper_closed and not self._was_closed_last_step:
-    self.prev_dist_to_goal = dist_part_to_goal  # reset on re-grasp
-```
+(Covered in Bug 6 above — included here as a warning because it doesn't crash,
+it just wastes allocations and signals incomplete cleanup.)
 
 ---
 
-### MINOR-5: `evaluation_utils.ROBOT_POS` Now Reads All Zeros
+## ⚠️ Warning 2 — `evaluate_policy.py` Does Not Wrap Env in `MomentumMonitor`
+
+**File:** `scripts/evaluate_policy.py`
 
 ```python
-ROBOT_POS = slice(0, 3)   # Now always [0., 0., 0.] after Fix 3.1
+env = TrussAssemblyEnv(render_mode="rgb_array", curriculum_stage=args.stage, ...)
+metrics = evaluate_policy_metrics(model, env, ...)
 ```
 
-This slice is exported and may be used by external analysis code. Add a comment or
-rename to `ROBOT_POS_ZEROED` to signal it carries no information. Better: remove the
-slice and keep only the meaningful relative vector constants.
+`evaluate_policy_metrics` reads `max_h` directly from `obs[H_SYS_NORM]` (which
+works correctly without the wrapper), but the `metrics.mean_max_momentum` field
+computed this way correctly tracks the episode max. The `MomentumMonitor` wrapper
+is only needed for TensorBoard logging during training. Evaluation is fine.
+
+No code change needed — just document why the wrapper is absent here.
 
 ---
 
-## Project Idea vs Implementation — Overall Assessment
+## ✅ Everything Confirmed Correct (21 Items)
 
-The research question is well-defined and the architecture is sound. Here's an honest
-assessment of alignment between concept and code:
+| Item | Status |
+|------|--------|
+| obs shape = 40, matches `observation_space` | ✅ |
+| All 11 obs index constants in `evaluation_utils.py` | ✅ All correct |
+| `_compute_system_angular_momentum` COM velocity fix (frame→COM) | ✅ |
+| Base link COM velocity correction in same function | ✅ |
+| `_cached_H_sys` shared between `_get_obs()` and `_compute_reward()` | ✅ |
+| Jacobian out of substep loop, computed once per policy step | ✅ |
+| Jacobian column slice `[:, :7]` (not `[:, 6:13]`) | ✅ |
+| `_movable_indices` cached in `_create_robot()` | ✅ |
+| `_handle_gripper()` inside substep loop | ✅ |
+| Right finger `targetPosition=target_pos` (sign fix) | ✅ |
+| `ee_link_idx = 7` (finger_left) | ✅ |
+| All `_create_robot()` calls pass `physicsClientId` | ✅ |
+| All `_create_part()` / `_create_goal()` calls pass `physicsClientId` | ✅ |
+| `continue_training.py` LR update patches `param_groups` | ✅ |
+| `SuccessRateCallback` no double-counting | ✅ |
+| `success_threshold` = 0.95→0.75 (not 1.00) | ✅ |
+| Consecutive evaluation requirement (2×) before advancing | ✅ |
+| `MomentumMonitor` wrapper tracks episode max correctly | ✅ |
+| `MomentumMonitor → Monitor` wrapping order correct | ✅ |
+| `evaluate_stage` uses unwrapped env, H_SYS_NORM tracked from obs | ✅ |
+| `timeouts` counter in reachable branch of `evaluation_utils` | ✅ |
 
-### What Is Working Well
+---
 
-**Curriculum structure** is correctly implemented now. The five-stage progression
-(keep → approach → grasp → transport → release) maps cleanly onto the reward functions,
-and the stage configs provide the right lever to tune each sub-skill independently.
+## Final Project Assessment
 
-**Momentum-awareness** is physically meaningful after Fix 1.2. The system now computes
-a geometrically correct H_sys, includes it in the observation, and penalizes it in the
-reward. The observation encodes both direction (H_sys vector) and magnitude (norm),
-which gives the policy sufficient information to learn momentum-minimizing behaviour.
+### What Is Now Fully Sound
 
-**Null-space control** architecture for task-space mode is conceptually correct after
-Fix 1.1. Damped-least-squares pseudo-inverse + null-space projection is the standard
-approach for redundant manipulators and is appropriate here.
+The architecture is clean and the implementation has converged on a good state.
+The core contributions of the project — momentum-aware observation, physically
+correct H_sys computation, null-space redundancy resolution, and curriculum
+progression — are all correctly implemented after the previous two rounds of fixes.
 
-**Reward shaping** is potential-based in structure (progress = Φ(t−1) − Φ(t)), which
-preserves the optimal policy under standard RL theory. The milestone bonuses are
-one-time and don't create a reward cycle.
+The observation space is now properly translation-invariant (40D, no absolute
+position). The `physicsClientId` propagation is ~95% complete. The `MomentumMonitor`
+wrapper solves the TensorBoard logging problem correctly. The curriculum advancement
+logic (2 consecutive evals, realistic thresholds) is solid.
 
-### What Still Needs Work Before Running
+### What Must Be Fixed Before Running
 
-1. **BUG-1 (gripper sign)** must be fixed before any training — the gripper cannot
-   open, making grasping physically impossible to execute and impossible to release.
+**Priority 1 — Will crash immediately:**
+- Bug 1: Remove `physicsClientId` from `invertTransform`, `multiplyTransforms`, `getMatrixFromQuaternion`
 
-2. **REMAINING-2 (double H_sys)** should be fixed before long training runs —
-   with 8 envs and 1M timesteps, the doubled O(N²) computation wastes hours.
+**Priority 2 — Silent corruption:**
+- Bug 2: Add `physicsClientId` to the two remaining `p.*` calls
+- Bug 4: Reset `grasp_hold_steps` when gripper opens in Stage 4
+- Bug 7: Cap the Station Keeping escalating reward spike
 
-3. **BUG-2 (Jacobian in loop)** only matters for `task_space` mode. If training in
-   `joint` mode (default), this can be deferred.
+**Priority 3 — Minor cleanup:**
+- Bug 3: Update `_get_obs()` docstring
+- Bug 5: Fix Stage 5 re-grasp `prev_dist_to_goal` reset logic
+- Bug 6: Remove dead `base_to_ee` / `robot_pos_arr` variables
 
-### Architectural Concern: Observation Contains Redundant Information
+### One Remaining Architectural Note
 
-After Fix 3.1, the observation has:
-- `robot_orn (4)` — absolute orientation of base
-- `robot_lin_vel (3)`, `robot_ang_vel (3)` — absolute velocities
-- `joint_pos (7)`, `joint_vel (7)` — joint state
-- `ee_to_part (3)`, `part_to_goal (3)`, `base_to_ee (3)` — relative vectors
-- `gripper_state (1)`, `contact_force (3)`, distances `(2)`, H_sys `(4)`
+The contact force observation (`contact_force[0:3]`) is still asymmetric — it only
+reports the total normal force as the X component with Y=Z=0. For a 7-DOF arm
+manipulating in 3D space, contact forces along all three axes carry useful
+information for the policy (especially for the release phase). If you want to
+improve Phase 3 performance in Stage 5, make this a real 3-axis measurement:
 
-`base_to_ee` is the forward kinematics output of `joint_pos`. It is entirely
-determined by `joint_pos` (given the URDF). Including both is redundant and adds 3
-dimensions of perfectly correlated information. Consider removing `base_to_ee` from
-the observation and letting the network learn FK implicitly from `joint_pos`.
-
-Similarly, `dist_to_part` and `dist_to_goal` are the norms of `ee_to_part` and
-`part_to_goal` respectively — they are exactly `||ee_to_part||` and `||part_to_goal||`.
-These are also fully redundant. The network can compute norms. Removing them shrinks
-the observation from 46 to 40 dimensions with zero information loss, which reduces
-network size and training time.
+```python
+if contact_points:
+    total_force = np.zeros(3)
+    for cp in contact_points:
+        normal = np.array(cp[7])           # contact normal direction (world frame)
+        force_magnitude = cp[9]            # normal force magnitude
+        total_force += force_magnitude * normal
+    contact_force = total_force.tolist()
+```

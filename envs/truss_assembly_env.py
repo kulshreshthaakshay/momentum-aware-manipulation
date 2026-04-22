@@ -131,6 +131,7 @@ class TrussAssemblyEnv(gym.Env):
         
         # Fix 2.4: Station keeping sustained success counter
         self.station_keeping_steps = 0
+        self._prev_gripper_closed = False  # Track for transition logic
         
         # Initial cached momentum for observation
         self._cached_H_sys = self._compute_system_angular_momentum()
@@ -378,7 +379,7 @@ class TrussAssemblyEnv(gym.Env):
         
         # 2. Logical Grasping (Constraint Injection)
         # Get EE State
-        ee_state = p.getLinkState(self.robot_id, self.ee_link_idx)
+        ee_state = p.getLinkState(self.robot_id, self.ee_link_idx, physicsClientId=self.physics_client)
         ee_pos = np.array(ee_state[0])
         ee_orn = ee_state[1]
         
@@ -388,11 +389,10 @@ class TrussAssemblyEnv(gym.Env):
         if should_close and not self.gripper_closed and dist_to_part < self.grasp_distance:
             # Compute the actual relative transform between EE and part at grasp time.
             # This avoids the spring oscillation caused by a hardcoded offset mismatch.
-            ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn, physicsClientId=self.physics_client)
+            ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn)
             local_pos, local_orn = p.multiplyTransforms(
                 ee_inv_pos, ee_inv_orn,
-                list(part_pos), list(part_orn),
-                physicsClientId=self.physics_client
+                list(part_pos), list(part_orn)
             )
             
             self.gripper_constraint = p.createConstraint(
@@ -457,7 +457,7 @@ class TrussAssemblyEnv(gym.Env):
                 omega = link_state[7]
 
             # Common rotation matrix
-            R_link = np.array(p.getMatrixFromQuaternion(orn, physicsClientId=self.physics_client)).reshape(3, 3)
+            R_link = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)
 
             if link_idx != -1:
                 # Fix 1.2: Correct via rigid-body kinematics: v_com = v_frame + omega × r_offset
@@ -471,7 +471,7 @@ class TrussAssemblyEnv(gym.Env):
                 vel = np.array(vel) + np.cross(np.array(omega), r_offset)
             
             # Rotation matrices
-            R_inertial = np.array(p.getMatrixFromQuaternion(local_inertial_orn, physicsClientId=self.physics_client)).reshape(3, 3)
+            R_inertial = np.array(p.getMatrixFromQuaternion(local_inertial_orn)).reshape(3, 3)
             R_world = R_link @ R_inertial
             
             # COM position in world frame
@@ -517,16 +517,16 @@ class TrussAssemblyEnv(gym.Env):
         Constructs the observation space using RELATIVE vectors for
         translation-invariant policy transfer between curriculum stages.
 
-        Robot: pos(3), orn(4), lin_vel(3), ang_vel(3) = 13
-        Arm: joint_pos(7), joint_vel(7) = 14
-        Relative: ee_to_part(3), part_to_goal(3), base_to_ee(3) = 9
-        Gripper: gripper_state(1) (0 or 1)
-        Contact: contact_force(3) (simplified)
-        Distances: dist_to_part(1), dist_to_goal(1)
-        Momentum: H_sys(3), ||H_sys||(1)
-        Total = 13 + 14 + 9 + 1 + 3 + 2 + 4 = 46
+        Robot (10): orn(4), lin_vel(3), ang_vel(3)
+        Arm   (14): joint_pos(7), joint_vel(7)
+        Relative(6): ee_to_part(3), part_to_goal(3)
+        Gripper (1): gripper_state(1)
+        Contact (3): contact_force(3)
+        Dist    (2): dist_to_part(1), dist_to_goal(1)
+        Momentum(4): H_sys(3), ||H_sys||(1)
+        Total = 10 + 14 + 6 + 1 + 3 + 2 + 4 = 40
         """
-        robot_pos, robot_orn = p.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.physics_client)
+        _, robot_orn = p.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.physics_client)
         robot_lin_vel, robot_ang_vel = p.getBaseVelocity(self.robot_id, physicsClientId=self.physics_client)
 
         # Arm joint states
@@ -546,21 +546,23 @@ class TrussAssemblyEnv(gym.Env):
         goal_pos = self.goal_pos
 
         # Relative vectors (translation-invariant: same regardless of world position)
-        robot_pos_arr = np.array(robot_pos)
         ee_to_part = part_pos - ee_pos          # Direction from EE to part
         part_to_goal = goal_pos - part_pos       # Direction from part to goal
-        base_to_ee = ee_pos - robot_pos_arr      # Arm offset from base
 
         # Gripper state (0 for open, 1 for closed)
         gripper_state = float(self.gripper_closed)
 
-        # Contact force (simplified)
+        # Contact force (3-axis measurement)
         contact_force = [0.0, 0.0, 0.0]
         if self.gripper_closed and self.gripper_constraint is not None:
             contact_points = p.getContactPoints(self.robot_id, self.part_id, self.ee_link_idx, -1, physicsClientId=self.physics_client)
             if contact_points:
-                total_normal_force = sum([cp[9] for cp in contact_points])
-                contact_force = [total_normal_force, 0.0, 0.0]
+                total_force = np.zeros(3)
+                for cp in contact_points:
+                    normal = np.array(cp[7])           # contact normal direction (world frame)
+                    force_magnitude = cp[9]            # normal force magnitude
+                    total_force += force_magnitude * normal
+                contact_force = total_force.tolist()
 
         # Distances
         dist_to_part = np.linalg.norm(ee_to_part)
@@ -623,7 +625,7 @@ class TrussAssemblyEnv(gym.Env):
         # H_sys_norm is now available for all stage blocks below (no re-computation)
         
         # Joint limit proximity penalty (smooth activation near URDF limits)
-        joint_states_for_limits = p.getJointStates(self.robot_id, self.arm_indices)
+        joint_states_for_limits = p.getJointStates(self.robot_id, self.arm_indices, physicsClientId=self.physics_client)
         joint_limit_penalty = 0.0
         for i, idx in enumerate(self.arm_indices):
             pos = joint_states_for_limits[i][0]
@@ -649,9 +651,10 @@ class TrussAssemblyEnv(gym.Env):
             # Fix 2.4: Require sustained station keeping for success
             if dist_from_origin < 0.1 and vel_magnitude < 0.1:
                 self.station_keeping_steps += 1
-                reward += 2.0 * self.station_keeping_steps  # Escalating reward
+                # Bug 7: Cap escalating reward to prevent PPO value spike
+                reward += min(1.0 * self.station_keeping_steps, 5.0)
                 if self.station_keeping_steps >= 20:  # ~0.4s of success
-                    reward += 200.0
+                    reward += 50.0  # Reduced bonus to avoid spike
                     info["success"] = True
             else:
                 self.station_keeping_steps = 0
@@ -745,6 +748,7 @@ class TrussAssemblyEnv(gym.Env):
             
             if not self.gripper_closed:
                 # PHASE 1: Approach and grasp (reuse Stage 3 logic)
+                self.grasp_hold_steps = 0  # Bug 4: Reset hold counter
                 progress = self.prev_dist_to_part - dist_to_part
                 reward += 50.0 * progress
                 
@@ -817,12 +821,13 @@ class TrussAssemblyEnv(gym.Env):
             if self.gripper_closed and not self.grasped_part:
                 self.grasped_part = True
             
+            # Bug 5: Reset prev_dist_to_goal on re-grasp transition
+            gripper_just_closed = self.gripper_closed and not getattr(self, "_prev_gripper_closed", False)
+            if gripper_just_closed and self.grasped_part:
+                self.prev_dist_to_goal = dist_part_to_goal
+
             if not self.gripper_closed:
                 self.grasp_hold_steps = 0
-                
-            # Minor-4: Re-grasp reset
-            if self.grasped_part and self.gripper_closed and not was_grasped_before:
-                self.prev_dist_to_goal = dist_part_to_goal
             
             # === PHASE 1: APPROACH AND GRASP ===
             if not was_grasped_before:
@@ -927,6 +932,7 @@ class TrussAssemblyEnv(gym.Env):
         info.setdefault("momentum_controlled_release", False)
         info.setdefault("high_momentum_release", False)
         
+        self._prev_gripper_closed = self.gripper_closed
         return reward, info
     
     def render(self):
@@ -962,7 +968,7 @@ if __name__ == "__main__":
     
     for stage in [1, 2, 3, 4]:
         print(f"\n--- Curriculum Stage {stage} ---")
-        env = TrussAssemblyEnv(render_mode="human", curriculum_stage=stage)
+        env = TrussAssemblyEnv(render_mode=None, curriculum_stage=stage)
         obs, info = env.reset()
         
         print(f"Observation shape: {obs.shape}")
