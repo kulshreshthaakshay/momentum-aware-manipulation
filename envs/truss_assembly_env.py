@@ -958,21 +958,19 @@ class TrussAssemblyEnv(gym.Env):
                         self.milestone_reached_goal_ever = True
                         self.milestone_reached_goal_area = True
                     
-                    self.steps_at_goal_holding += 1
+                    # Significant-15: Fixed penalty (Markovian) instead of escalating
+                    # This ensures identical states have identical rewards
+                    reward -= 2.0
                     
-                    # ESCALATING penalty for holding at goal - gets worse over time!
-                    # This creates urgency to release
-                    hold_penalty = 0.5 + (self.steps_at_goal_holding * 0.1)
-                    hold_penalty = min(hold_penalty, 5.0)  # Cap at 5.0 per step
-                    reward -= hold_penalty
+                    # Explicit release incentive: signal that opening is good here
+                    # gripper_action is index 12 in task_space, 13 in joint mode (both are last)
+                    if action[-1] < -0.3: # Threshold slightly below gripper_threshold
+                        reward += 5.0
                     
-                    # Explicit signal: "You're at goal, RELEASE NOW!"
-                    # The gripper action observation helps agent learn gripper=-1 is needed
                     info["at_goal_holding"] = True
-                    info["steps_holding_at_goal"] = self.steps_at_goal_holding
                 else:
-                    # Gentle decay avoids brittle reset due small drift near boundary.
-                    self.steps_at_goal_holding = max(0, self.steps_at_goal_holding - 1)
+                    # Clear flag if drifted out
+                    self.milestone_reached_goal_area = False
             
             # === PHASE 3: RELEASE AT GOAL ===
             elif self.grasped_part and not self.gripper_closed:
