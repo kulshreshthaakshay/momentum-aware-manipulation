@@ -541,8 +541,9 @@ class TrussAssemblyEnv(gym.Env):
             com_numerator += mass * com_world
             body_data.append((mass, com_world, vel_world, omega_world, I_world))
 
-        num_joints = p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)
-        for idx in range(-1, num_joints):
+        # Fix: Iterate only over movable joints (performance optimization)
+        add_body_link(self.robot_id, -1)
+        for idx in self._movable_indices:
             add_body_link(self.robot_id, idx)
 
         if self.part_id is not None:
