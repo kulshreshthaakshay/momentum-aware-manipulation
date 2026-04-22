@@ -225,7 +225,10 @@ def run_curriculum(
         train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
         
         eval_env_raw = make_env(stage, config['max_steps'], control_mode)()
-        eval_env = Monitor(eval_env_raw) # Simplified Monitor for eval
+        eval_env = Monitor(eval_env_raw)
+        eval_env = DummyVecEnv([lambda: eval_env])
+        # Significant-12: Eval env must use VecNormalize with synced stats
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False, clip_obs=10.0)
         
         # Create or transfer model
         if model is None:
@@ -291,6 +294,10 @@ def run_curriculum(
         success_callback = SuccessRateCallback(check_freq=25000, verbose=verbose)
         # Fix 4.4: Use deterministic=False for early stages (stochastic exploration)
         eval_deterministic = stage >= 4
+        
+        # Significant-12: Sync eval env stats with train env before training starts
+        eval_env.obs_rms = train_env.obs_rms
+        eval_env.ret_rms = train_env.ret_rms
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=f"{save_dir}/stage{stage}_best",
