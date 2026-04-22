@@ -12,8 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from datetime import datetime
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.monitor import Monitor
 from envs.truss_assembly_env import TrussAssemblyEnv
 import numpy as np
 
@@ -27,18 +28,30 @@ def make_env(stage, max_steps):
 def evaluate(model, stage, max_steps, n_episodes=50):
     """Quick evaluation."""
     env = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps)
+    
+    # Bug-8: Apply normalization for evaluation if model has stats
+    if hasattr(model, "get_vec_normalize_env") and model.get_vec_normalize_env() is not None:
+        stats_env = model.get_vec_normalize_env()
+        eval_env = DummyVecEnv([lambda: env])
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+        eval_env.obs_rms = stats_env.obs_rms
+        eval_env.ret_rms = stats_env.ret_rms
+        eval_env.clip_obs = stats_env.clip_obs
+    else:
+        eval_env = DummyVecEnv([lambda: env])
+        
     successes = 0
     for _ in range(n_episodes):
-        obs, _ = env.reset()
+        obs = eval_env.reset()
         for _ in range(max_steps):
             action, _ = model.predict(obs, deterministic=False)
-            obs, _, terminated, truncated, info = env.step(action)
-            if info.get('success'):
+            obs, _, done, info = eval_env.step(action)
+            if info[0].get('success'):
                 successes += 1
                 break
-            if terminated or truncated:
+            if done:
                 break
-    env.close()
+    eval_env.close()
     return successes / n_episodes * 100
 
 
@@ -69,10 +82,27 @@ def continue_training(
     
     # Create environments
     train_env = SubprocVecEnv([make_env(stage, max_steps) for _ in range(n_envs)])
-    eval_env = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    
+    # Evaluator needs Monitor for stats
+    eval_env_raw = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps)
+    eval_env = Monitor(eval_env_raw)
+    eval_env = DummyVecEnv([lambda: eval_env])
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
     
     # Load model
     print(f"\nLoading model from: {model_path}")
+    
+    # Bug-8: Load normalization stats
+    stats_path = model_path.replace(".zip", "_vecnorm.pkl")
+    if os.path.exists(stats_path):
+        print(f"Loading normalization stats from: {stats_path}")
+        train_env = VecNormalize.load(stats_path, train_env)
+        # Sync eval env stats
+        eval_env.obs_rms = train_env.obs_rms
+        eval_env.ret_rms = train_env.ret_rms
+        eval_env.clip_obs = train_env.clip_obs
+        
     model = PPO.load(model_path, env=train_env, device='cpu')
     
     # Optionally adjust learning rate for fine-tuning
