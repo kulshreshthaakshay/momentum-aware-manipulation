@@ -153,6 +153,10 @@ class TrussAssemblyEnv(gym.Env):
         self.milestone_first_grasp = False
         self.milestone_reached_goal_area = False
         
+        # Significant-14: Persistent flags to prevent reward hacking via re-grasp loops (Stage 5)
+        self.milestone_first_grasp_ever = False
+        self.milestone_reached_goal_ever = False
+        
         # Fix 2.1: Grasp hold counter for Stage 3
         self.grasp_hold_steps = 0
         
@@ -897,8 +901,9 @@ class TrussAssemblyEnv(gym.Env):
                     if self.gripper_closed:
                         self.grasp_hold_steps += 1
                         # Fix 4: First grasp milestone bonus (require 3 holds)
-                        if not self.milestone_first_grasp and self.grasp_hold_steps >= 3:
+                        if not self.milestone_first_grasp_ever and self.grasp_hold_steps >= 3:
                             reward += MILESTONE_BONUS
+                            self.milestone_first_grasp_ever = True
                             self.milestone_first_grasp = True
                             self.prev_dist_to_goal = dist_part_to_goal
                         elif self.milestone_first_grasp:
@@ -936,8 +941,9 @@ class TrussAssemblyEnv(gym.Env):
                 )
                 if at_release_zone:
                     # Fix 4: First time reaching goal area milestone
-                    if not self.milestone_reached_goal_area:
+                    if not self.milestone_reached_goal_ever:
                         reward += 100.0  # ONE-TIME bonus for reaching goal!
+                        self.milestone_reached_goal_ever = True
                         self.milestone_reached_goal_area = True
                     
                     self.steps_at_goal_holding += 1
@@ -976,6 +982,7 @@ class TrussAssemblyEnv(gym.Env):
                     reward -= 20.0 # Recoverable penalty
                     self.grasped_part = False
                     self.milestone_first_grasp = False
+                    self.milestone_reached_goal_area = False # Allow re-entering Phase 2
                     info["dropped_early"] = True
             
             # NOTE: Global momentum penalty (0.01 * |H_sys|) is already applied at line 608.
