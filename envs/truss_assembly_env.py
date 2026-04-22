@@ -907,127 +907,109 @@ class TrussAssemblyEnv(gym.Env):
                         info["success"] = True
         
         else:  # Stage 5: Full assembly sequence (approach → grasp → transport → release)
-            # Initialize tracking
             if self.prev_dist_to_part is None:
                 self.prev_dist_to_part = dist_to_part
             if self.prev_dist_to_goal is None:
                 self.prev_dist_to_goal = dist_part_to_goal
-            
-            # Track time spent at goal while holding (for escalating penalty)
+                
             if not hasattr(self, 'steps_at_goal_holding'):
                 self.steps_at_goal_holding = 0
-            
-            was_grasped_before = self.grasped_part
-            if self.gripper_closed and not self.grasped_part:
-                self.grasped_part = True
-            
-            # Bug 5: Reset prev_dist_to_goal on re-grasp transition
-            gripper_just_closed = self.gripper_closed and not getattr(self, "_prev_gripper_closed", False)
-            if gripper_just_closed and self.grasped_part:
-                self.prev_dist_to_goal = dist_part_to_goal
 
-            if not self.gripper_closed:
-                self.grasp_hold_steps = 0
+            # Detect if part was just released (dropped or released at goal)
+            just_released = getattr(self, "_prev_gripper_closed", False) and not self.gripper_closed
             
-            # === PHASE 1: APPROACH AND GRASP ===
-            if not was_grasped_before:
-                # Progress toward part
-                progress = self.prev_dist_to_part - dist_to_part
-                reward += 50.0 * progress
-                
-                # Velocity toward part bonus
-                direction_to_part = (part_pos - ee_pos) / (dist_to_part + 1e-6)
-                velocity_toward = np.dot(ee_vel, direction_to_part)
-                reward += 2.0 * max(0, velocity_toward)
-                
-                if dist_to_part < self.grasp_distance:
-                    if self.gripper_closed:
-                        self.grasp_hold_steps += 1
-                        # Fix 4: First grasp milestone bonus (require 3 holds)
-                        if not self.milestone_first_grasp_ever and self.grasp_hold_steps >= 3:
-                            reward += MILESTONE_BONUS
-                            self.milestone_first_grasp_ever = True
-                            self.milestone_first_grasp = True
-                        elif self.milestone_first_grasp:
-                            reward += 20.0  # Regular grasp bonus
-                    else:
-                        reward -= 2.0  # Penalty for being close but not grasping
-                        reward += 2.0 * max(0.0, gripper_cmd)
-                else:
-                    reward -= 0.2 * max(0.0, gripper_cmd)
-                
-                self.prev_dist_to_part = dist_to_part
-            
-            # === PHASE 2: TRANSPORT TO GOAL ===
-            elif self.gripper_closed:
-                if self.prev_dist_to_goal is None:
-                    self.prev_dist_to_goal = dist_part_to_goal
-                
-                # Progress toward goal
-                # Fix 2.2: Unified progress multiplier, clipped non-negative
-                goal_progress = self.prev_dist_to_goal - dist_part_to_goal
-                reward += 100.0 * max(0.0, goal_progress)
-                
-                self.prev_dist_to_goal = dist_part_to_goal
-                direction_to_goal = (self.goal_pos - part_pos) / (dist_part_to_goal + 1e-6)
-                reward += 4.0 * max(0.0, np.dot(part_vel, direction_to_goal))
-                
-                # Velocity damping near goal: penalize excess speed to prevent overshoot
-                if dist_part_to_goal < 1.0:
-                    approach_speed = np.linalg.norm(part_vel)
-                    desired_max_speed = dist_part_to_goal * 0.5
-                    excess_speed = max(0, approach_speed - desired_max_speed)
-                    reward -= 5.0 * excess_speed
-                
-                # === AT GOAL: MUST RELEASE ===
-                at_release_zone = (
-                    dist_part_to_goal < self.at_goal_distance
-                    or (self.milestone_reached_goal_area and dist_part_to_goal < 0.50)
-                )
-                if at_release_zone:
-                    # Fix 4: First time reaching goal area milestone
-                    if not self.milestone_reached_goal_ever:
-                        reward += 100.0  # ONE-TIME bonus for reaching goal!
-                        self.milestone_reached_goal_ever = True
-                        self.milestone_reached_goal_area = True
-                    
-                    # Significant-15: Fixed penalty (Markovian) instead of escalating
-                    # This ensures identical states have identical rewards
-                    reward -= 2.0
-                    
-                    # Explicit release incentive: signal that opening is good here
-                    # gripper_action is index 12 in task_space, 13 in joint mode (both are last)
-                    if action[-1] < -0.3: # Threshold slightly below gripper_threshold
-                        reward += 5.0
-                    
-                    self.steps_at_goal_holding += 1
-                    info["at_goal_holding"] = True
-                else:
-                    # Clear flag if drifted out
-                    self.milestone_reached_goal_area = False
-            
-            # === PHASE 3: RELEASE AT GOAL ===
-            elif self.grasped_part and not self.gripper_closed:
-                # Part has been released! Check if at goal
+            if just_released:
                 if dist_part_to_goal < self.release_distance:
-                    # SUCCESS! Give massive reward
+                    # SUCCESS! Released at goal
                     H_release = H_sys_norm
                     release_bonus = SUCCESS_BONUS
                     if H_release < 0.2:
-                        reward += MILESTONE_BONUS # Momentum bonus
+                        reward += MILESTONE_BONUS
                         info["momentum_controlled_release"] = True
                     elif H_release > 0.5:
-                        reward -= MILESTONE_BONUS # High momentum penalty
+                        reward -= MILESTONE_BONUS
                         info["high_momentum_release"] = True
                     reward += release_bonus
                     info["success"] = True
                 else:
-                    # Critical-4: Allow re-grasp instead of terminal punishment loop
-                    reward -= 20.0 # Recoverable penalty
-                    self.grasped_part = False
-                    self.milestone_first_grasp = False
-                    self.milestone_reached_goal_area = False # Allow re-entering Phase 2
+                    # DROPPED EARLY: Recoverable penalty
+                    reward -= 20.0
+                    self.grasp_hold_steps = 0
+                    self.milestone_reached_goal_area = False
                     info["dropped_early"] = True
+                    # Let it transition back to Phase 1 next step
+
+            if not info.get("success", False) and not just_released:
+                if not self.gripper_closed:
+                    # === PHASE 1: APPROACH AND GRASP ===
+                    self.grasp_hold_steps = 0
+                    progress = self.prev_dist_to_part - dist_to_part
+                    reward += 50.0 * progress
+                    
+                    if dist_to_part > self.grasp_distance:
+                        direction_to_part = (part_pos - ee_pos) / (dist_to_part + 1e-6)
+                        velocity_toward = np.dot(ee_vel, direction_to_part)
+                        reward += 2.0 * max(0, velocity_toward)
+                        reward -= 0.2 * max(0.0, gripper_cmd)
+                    else:
+                        reward += 2.0 * max(0.0, gripper_cmd)
+                        reward -= 1.0 * max(0.0, -gripper_cmd)
+                        
+                    self.prev_dist_to_part = dist_to_part
+                    
+                else:
+                    # === PHASE 2: TRANSPORT TO GOAL ===
+                    self.grasp_hold_steps += 1
+                    
+                    if self.grasp_hold_steps == 1:
+                        # First step of grasp, reset goal distance tracker
+                        self.prev_dist_to_goal = dist_part_to_goal
+                    
+                    if not self.milestone_first_grasp_ever and self.grasp_hold_steps >= 3:
+                        reward += MILESTONE_BONUS
+                        self.milestone_first_grasp_ever = True
+                        
+                    if self.grasp_hold_steps < 3:
+                        # Waiting to stabilize grasp
+                        reward += 2.0
+                    else:
+                        # Transporting
+                        goal_progress = self.prev_dist_to_goal - dist_part_to_goal
+                        reward += 100.0 * max(0.0, goal_progress)
+                        self.prev_dist_to_goal = dist_part_to_goal
+                        
+                        direction_to_goal = (self.goal_pos - part_pos) / (dist_part_to_goal + 1e-6)
+                        reward += 4.0 * max(0.0, np.dot(part_vel, direction_to_goal))
+                        
+                        # Velocity damping near goal: penalize excess speed to prevent overshoot
+                        if dist_part_to_goal < 1.0:
+                            approach_speed = np.linalg.norm(part_vel)
+                            desired_max_speed = dist_part_to_goal * 0.5
+                            excess_speed = max(0, approach_speed - desired_max_speed)
+                            reward -= 5.0 * excess_speed
+                            
+                        # === AT GOAL: MUST RELEASE ===
+                        at_release_zone = (
+                            dist_part_to_goal < self.at_goal_distance
+                            or (self.milestone_reached_goal_area and dist_part_to_goal < 0.50)
+                        )
+                        
+                        if at_release_zone:
+                            if not self.milestone_reached_goal_ever:
+                                reward += 100.0
+                                self.milestone_reached_goal_ever = True
+                                self.milestone_reached_goal_area = True
+                                
+                            reward -= 2.0
+                            
+                            # Explicit release incentive
+                            if action[-1] < -0.3:
+                                reward += 5.0
+                                
+                            self.steps_at_goal_holding += 1
+                            info["at_goal_holding"] = True
+                        else:
+                            self.milestone_reached_goal_area = False
 
         info.setdefault("success", False)
         info.setdefault("dropped_early", False)
