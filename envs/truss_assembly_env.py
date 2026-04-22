@@ -91,13 +91,18 @@ class TrussAssemblyEnv(gym.Env):
         
         if self.render_mode == "human":
             self.physics_client = p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0,
+                                       physicsClientId=self.physics_client)
         else:
             self.physics_client = p.connect(p.DIRECT)
         
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setGravity(0, 0, 0)  # MICROGRAVITY!
-        p.setTimeStep(self.dt)
+        # Fix 1.3: Assert connection succeeded before proceeding
+        assert self.physics_client >= 0, "PyBullet connection failed"
+        
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(),
+                                  physicsClientId=self.physics_client)
+        p.setGravity(0, 0, 0, physicsClientId=self.physics_client)  # MICROGRAVITY!
+        p.setTimeStep(self.dt, physicsClientId=self.physics_client)
         
         # Create robot from URDF
         self._create_robot()
@@ -120,6 +125,12 @@ class TrussAssemblyEnv(gym.Env):
         # Fix 4: Milestone tracking for one-time bonuses
         self.milestone_first_grasp = False
         self.milestone_reached_goal_area = False
+        
+        # Fix 2.1: Grasp hold counter for Stage 3
+        self.grasp_hold_steps = 0
+        
+        # Fix 2.4: Station keeping sustained success counter
+        self.station_keeping_steps = 0
         
         obs = self._get_obs()
         info = {"stage": self.curriculum_stage}
@@ -169,10 +180,8 @@ class TrussAssemblyEnv(gym.Env):
         for i in range(p.getNumJoints(self.robot_id)):
             p.changeDynamics(self.robot_id, i, linearDamping=0.0, angularDamping=0.0, jointDamping=0.0)
         
-        # Update EE offset logic to use link index
-        # Endpoint is link 8 (gripper_joint child)? or just use link 6 (wrist roll)
-        # Let's use the last wrist link (Link 6) or gripper (Link 7)
-        self.ee_link_idx = 6
+        # Fix 5.2: Use finger_left link for EE reference (actual fingertip)
+        self.ee_link_idx = 7
         
         # Cache joint limits from URDF for proximity penalty
         self.joint_limits = []
@@ -306,14 +315,10 @@ class TrussAssemblyEnv(gym.Env):
                 # self.arm_indices are [0, 1, 2, 3, 4, 5, 6].
                 # So we want columns 6 + 0 to 6 + 6 == columns 6 to 12.
                 
-                # Verify assumption: arm indices are the first 7 movable joints?
-                # Based on debug output: 0-6 are arm joints. So yes.
-                
-                start_col = 6 # Skip 6 base DoFs
-                arm_cols = [start_col + i for i in range(len(self.arm_indices))]
-                
-                linear_jacobian = np.array(linear_jacobian)[:, arm_cols]
-                angular_jacobian = np.array(angular_jacobian)[:, arm_cols]
+                # Fix 1.1: PyBullet Jacobian columns = movable joints only, no base DoFs.
+                # arm_indices = [0..6] → first 7 columns of the N_movable-column matrix.
+                linear_jacobian = np.array(linear_jacobian)[:, :len(self.arm_indices)]  # (3,7)
+                angular_jacobian = np.array(angular_jacobian)[:, :len(self.arm_indices)]  # (3,7)
                 
                 # Stack to get full 6x7 Jacobian
                 J = np.vstack([linear_jacobian, angular_jacobian]) # Shape (6, 7)
@@ -335,8 +340,10 @@ class TrussAssemblyEnv(gym.Env):
                 # We want q_dot_0 to damp internal motion (q_dot_0 = -k * dq)
                 # This minimizes unnecessary joint movement ("lazy arm")
                 
-                # Extract arm velocities (first 7 movable joints) for damping
-                dq_arm = np.array(dq_movable[:7])
+                # Fix 6.1: Explicitly get arm joint velocities (not relying on ordering)
+                arm_joint_states = p.getJointStates(self.robot_id, self.arm_indices,
+                                                    physicsClientId=self.physics_client)
+                dq_arm = np.array([s[1] for s in arm_joint_states])
                 
                 I = np.eye(7)
                 null_projector = I - (J_pinv @ J)
@@ -457,14 +464,25 @@ class TrussAssemblyEnv(gym.Env):
             local_inertial_orn = dyn_info[4]
             
             if link_idx == -1:
-                pos, orn = p.getBasePositionAndOrientation(body_id)
-                vel, omega = p.getBaseVelocity(body_id)
+                pos, orn = p.getBasePositionAndOrientation(body_id,
+                                                           physicsClientId=self.physics_client)
+                vel, omega = p.getBaseVelocity(body_id,
+                                               physicsClientId=self.physics_client)
             else:
-                link_state = p.getLinkState(body_id, link_idx, computeLinkVelocity=1)
+                # Fix 1.2: Use computeForwardKinematics=1 and correct COM velocity
+                link_state = p.getLinkState(body_id, link_idx,
+                                            computeLinkVelocity=1,
+                                            computeForwardKinematics=1,
+                                            physicsClientId=self.physics_client)
                 pos = link_state[4]     # World position of link frame
                 orn = link_state[5]     # World orientation of link frame
-                vel = link_state[6]     # World linear velocity of link COM
-                omega = link_state[7]   # World angular velocity of link
+                # Fix 1.2: getLinkState[6] is velocity at link FRAME origin, not COM.
+                # Correct via rigid-body kinematics: v_com = v_frame + omega × r_offset
+                frame_vel = np.array(link_state[6])
+                omega = link_state[7]
+                R_link_tmp = np.array(p.getMatrixFromQuaternion(link_state[5])).reshape(3, 3)
+                r_offset = R_link_tmp @ local_inertial_pos
+                vel = frame_vel + np.cross(np.array(omega), r_offset)
             
             # Rotation matrices
             R_link = np.array(p.getMatrixFromQuaternion(orn)).reshape(3, 3)
@@ -567,8 +585,11 @@ class TrussAssemblyEnv(gym.Env):
         H_sys = self._compute_system_angular_momentum()
         H_sys_magnitude = np.linalg.norm(H_sys)
 
+        # Fix 3.1: Replace absolute robot_pos with zeros for translation-invariant transfer.
+        # The relative vectors (ee_to_part, part_to_goal, base_to_ee) already encode
+        # all spatial information needed. Absolute position hurts curriculum transfer.
         obs = np.array(
-            list(robot_pos) + list(robot_orn) + list(robot_lin_vel) + list(robot_ang_vel) +
+            [0.0, 0.0, 0.0] + list(robot_orn) + list(robot_lin_vel) + list(robot_ang_vel) +
             list(joint_pos) + list(joint_vel) +
             list(ee_to_part) +
             list(part_to_goal) +
@@ -614,11 +635,12 @@ class TrussAssemblyEnv(gym.Env):
         joint_penalty = 0.0005 * np.sum(np.abs(action[6:]))  # Arm joints + gripper (electric)
         fuel_penalty = rcs_penalty + joint_penalty
         
-        # Total system angular momentum penalty (momentum-awareness)
+        # Fix 2.3: Compute H_sys ONCE and cache — avoid O(N²) duplicate calls
         H_sys = self._compute_system_angular_momentum()
         H_sys_norm = np.linalg.norm(H_sys)
         info["H_sys_norm"] = H_sys_norm
         momentum_penalty = 0.01 * H_sys_norm
+        # H_sys_norm is now available for all stage blocks below (no re-computation)
         
         # Joint limit proximity penalty (smooth activation near URDF limits)
         joint_states_for_limits = p.getJointStates(self.robot_id, self.arm_indices)
@@ -644,9 +666,15 @@ class TrussAssemblyEnv(gym.Env):
             reward += 1.0 - dist_from_origin  # Max +1 at origin
             reward -= 0.1 * vel_magnitude
             
+            # Fix 2.4: Require sustained station keeping for success
             if dist_from_origin < 0.1 and vel_magnitude < 0.1:
-                reward += 10.0
-                info["success"] = True
+                self.station_keeping_steps += 1
+                reward += 2.0 * self.station_keeping_steps  # Escalating reward
+                if self.station_keeping_steps >= 20:  # ~0.4s of success
+                    reward += 200.0
+                    info["success"] = True
+            else:
+                self.station_keeping_steps = 0
         
         elif self.curriculum_stage == 2:
             # Approach part - PROGRESS-BASED shaping
@@ -714,14 +742,19 @@ class TrussAssemblyEnv(gym.Env):
             
             # Success: Grasped! MUCH bigger reward
             # Success: Grasped! MUCH bigger reward
+            # Fix 2.1: Require N consecutive steps of closed gripper for Stage 3 success
             if self.gripper_closed:
+                self.grasp_hold_steps += 1
                 # Fix: Milestone bonus for first grasp (crucial for learning)
                 if not self.milestone_first_grasp:
                     reward += 200.0  # Milestone bonus!
                     self.milestone_first_grasp = True
                 
-                reward += 500.0  # Success reward
-                info["success"] = True
+                if self.grasp_hold_steps >= 5:  # Hold for 5 consecutive steps
+                    reward += 500.0  # Success reward
+                    info["success"] = True
+            else:
+                self.grasp_hold_steps = 0
         
         elif self.curriculum_stage == 4:
             # Transport part to goal - two phases: grasp then transport
@@ -757,10 +790,12 @@ class TrussAssemblyEnv(gym.Env):
                 if not self.milestone_first_grasp:
                     reward += 200.0  # Milestone bonus!
                     self.milestone_first_grasp = True
+                    # Fix 6.2: Reset prev_dist_to_goal at grasp transition
+                    self.prev_dist_to_goal = dist_part_to_goal
                 
-                # Progress toward goal
+                # Fix 2.2: Unified progress multiplier, clipped non-negative
                 goal_progress = self.prev_dist_to_goal - dist_part_to_goal
-                reward += 80.0 * goal_progress  # Strong transport incentive
+                reward += 100.0 * max(0.0, goal_progress)  # Same scale as Stage 5
                 
                 # Velocity toward goal
                 direction_to_goal = (self.goal_pos - part_pos) / (dist_part_to_goal + 1e-6)
@@ -831,8 +866,9 @@ class TrussAssemblyEnv(gym.Env):
             # === PHASE 2: TRANSPORT TO GOAL ===
             elif self.gripper_closed:
                 # Progress toward goal
+                # Fix 2.2: Unified progress multiplier, clipped non-negative
                 goal_progress = self.prev_dist_to_goal - dist_part_to_goal
-                reward += 150.0 * goal_progress
+                reward += 100.0 * max(0.0, goal_progress)
                 
                 self.prev_dist_to_goal = dist_part_to_goal
                 direction_to_goal = (self.goal_pos - part_pos) / (dist_part_to_goal + 1e-6)

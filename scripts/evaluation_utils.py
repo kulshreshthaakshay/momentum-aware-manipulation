@@ -137,11 +137,12 @@ def evaluate_policy_metrics(
             if terminated or truncated:
                 if info.get("dropped_early", False):
                     early_drops += 1
-                else:
-                    timeouts += 1
+                elif not info.get("success", False):
+                    timeouts += 1  # Fix 7.2: count timeouts here, not in unreachable else
                 lengths.append(step + 1)
                 break
         else:
+            # Fallback: loop exhausted without break (shouldn't happen normally)
             timeouts += 1
             lengths.append(env.max_steps)
 

@@ -30,39 +30,40 @@ import json
 
 
 # Stage-specific configurations
+# Fix 4.1: Practical success thresholds (100% is unreachable with stochastic eval)
 STAGE_CONFIGS = {
     1: {
         "name": "Station Keeping",
         "max_steps": 500,
-        "success_threshold": 1.00,
+        "success_threshold": 0.95,
         "min_timesteps": 50000,
         "max_timesteps": 200000,
     },
     2: {
         "name": "Approach",
         "max_steps": 500,
-        "success_threshold": 1.00,
+        "success_threshold": 0.90,
         "min_timesteps": 50000,
         "max_timesteps": 200000,
     },
     3: {
         "name": "Grasp",
         "max_steps": 600,
-        "success_threshold": 1.00,
+        "success_threshold": 0.85,
         "min_timesteps": 150000,
         "max_timesteps": 500000,
     },
     4: {
         "name": "Transport",
         "max_steps": 800,
-        "success_threshold": 1.00,
+        "success_threshold": 0.80,
         "min_timesteps": 100000,
         "max_timesteps": 400000,
     },
     5: {
         "name": "Full Assembly",
         "max_steps": 1000,
-        "success_threshold": 1.00,
+        "success_threshold": 0.75,
         "min_timesteps": 200000,
         "max_timesteps": 1000000,
     },
@@ -95,12 +96,12 @@ class SuccessRateCallback(BaseCallback):
         self.success_rates = []
         
     def _on_step(self):
+        # Fix 4.3: Only count at episode boundaries, single condition to avoid double-counting
         if self.locals.get('infos'):
             for info in self.locals['infos']:
                 if 'episode' in info:
                     self.episodes += 1
-                    episode_info = info.get('episode', {})
-                    if info.get('success', False) or episode_info.get('success', False):
+                    if info.get('success', False):
                         self.successes += 1
         
         if self.n_calls % self.check_freq == 0 and self.episodes > 0:
@@ -211,19 +212,28 @@ def run_curriculum(
             # Transfer to new environment
             print("\n  Transferring model to new stage...")
             model.set_env(train_env)
-            # Optionally reduce learning rate for later stages
+            # Fix 4.2: Reduce LR AND force optimizer update for later stages
             if stage >= 4:
-                model.learning_rate = PPO_CONFIG["learning_rate"] / 2
+                new_lr = PPO_CONFIG["learning_rate"] / 2
+                model.learning_rate = new_lr
+                for param_group in model.policy.optimizer.param_groups:
+                    param_group['lr'] = new_lr
+        
+        # Fix 4.5: Validate buffer size is divisible by batch_size
+        assert (n_envs * PPO_CONFIG["n_steps"]) % PPO_CONFIG["batch_size"] == 0, \
+            f"n_envs={n_envs} * n_steps={PPO_CONFIG['n_steps']} not divisible by batch_size={PPO_CONFIG['batch_size']}"
         
         # Callbacks
         success_callback = SuccessRateCallback(check_freq=25000, verbose=verbose)
+        # Fix 4.4: Use deterministic=False for early stages (stochastic exploration)
+        eval_deterministic = stage >= 4
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=f"{save_dir}/stage{stage}_best",
             log_path=f"{save_dir}/stage{stage}_logs",
             eval_freq=max(config['min_timesteps'] // 4, 10000),
             n_eval_episodes=20,
-            deterministic=True,
+            deterministic=eval_deterministic,
             verbose=1
         )
         

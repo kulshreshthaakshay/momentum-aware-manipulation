@@ -27,45 +27,9 @@ def evaluate(args):
         model = SAC.load(args.model_path)
     
     n_episodes = args.episodes
-    best_episode_reward = -np.inf
-    best_episode_frames = []
-    
     print(f"\nEvaluating for {n_episodes} episodes...")
     
-    for i in range(n_episodes):
-        obs, info = env.reset()
-        done = False
-        truncated = False
-        episode_reward = 0
-        frames = []
-        max_momentum = float(obs[H_SYS_NORM])
-        
-        step = 0
-        while not (done or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
-            episode_reward += reward
-            max_momentum = max(max_momentum, float(obs[H_SYS_NORM]))
-            step += 1
-            
-            # Capture frame for best episode
-            if args.save_gif:
-                frame = env.render()
-                frames.append(frame)
-        
-        if info.get("success", False):
-            print(f"  Episode {i+1}: SUCCESS (Reward: {episode_reward:.1f}, Max |H|: {max_momentum:.4f})")
-        else:
-            reason = "Timeout"
-            if info.get("dropped_early", False):
-                reason = "Dropped Early"
-            print(f"  Episode {i+1}: FAIL - {reason} (Reward: {episode_reward:.1f}, Max |H|: {max_momentum:.4f})")
-        
-        # Save best episode GIF
-        if episode_reward > best_episode_reward:
-            best_episode_reward = episode_reward
-            best_episode_frames = frames
-            
+    # Fix 7.1: Run evaluate_policy_metrics ONCE for accurate aggregate metrics
     metrics = evaluate_policy_metrics(model, env, n_episodes=n_episodes, deterministic=True)
     
     print("\n" + "="*50)
@@ -74,19 +38,40 @@ def evaluate(args):
     print_metrics(metrics, prefix="")
     print(f"Failures: Timeout={metrics.timeouts}, Drop={metrics.early_drops}, HighMomentumRelease={metrics.high_momentum_releases}")
     
-    if args.save_gif and len(best_episode_frames) > 0:
-        gif_path = os.path.join(os.path.dirname(args.model_path), "eval_best_episode.gif")
-        print(f"\nSaving GIF to: {gif_path}")
+    # Separate GIF-capture run (only the best episode)
+    if args.save_gif:
+        print(f"\nCapturing GIF of best episode...")
+        best_episode_reward = -np.inf
+        best_episode_frames = []
+        for i in range(min(n_episodes, 5)):  # Limit GIF candidates to 5
+            obs, info = env.reset()
+            done = False
+            truncated = False
+            episode_reward = 0
+            frames = []
+            
+            while not (done or truncated):
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, done, truncated, info = env.step(action)
+                episode_reward += reward
+                frame = env.render()
+                frames.append(frame)
+            
+            if episode_reward > best_episode_reward:
+                best_episode_reward = episode_reward
+                best_episode_frames = frames
         
-        # Convert frames to PIL images
-        pil_images = [Image.fromarray(frame) for frame in best_episode_frames]
-        pil_images[0].save(
-            gif_path,
-            save_all=True,
-            append_images=pil_images[1:],
-            duration=33,  # 30 fps
-            loop=0
-        )
+        if len(best_episode_frames) > 0:
+            gif_path = os.path.join(os.path.dirname(args.model_path), "eval_best_episode.gif")
+            print(f"Saving GIF to: {gif_path}")
+            pil_images = [Image.fromarray(frame) for frame in best_episode_frames]
+            pil_images[0].save(
+                gif_path,
+                save_all=True,
+                append_images=pil_images[1:],
+                duration=33,
+                loop=0
+            )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
