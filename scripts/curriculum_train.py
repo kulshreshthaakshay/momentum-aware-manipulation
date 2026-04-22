@@ -163,7 +163,11 @@ def evaluate_stage(model, stage, max_steps, control_mode="joint", n_episodes=50)
         # Create a dummy vec env to wrap the single eval env
         eval_env = DummyVecEnv([lambda: env])
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+        # Significant-12: Copy complete normalization state for accurate evaluation
         eval_env.obs_rms = stats_env.obs_rms
+        eval_env.ret_rms = stats_env.ret_rms
+        eval_env.clip_obs = stats_env.clip_obs
+        eval_env.clip_reward = stats_env.clip_reward
         
         metrics = evaluate_policy_metrics(model, eval_env, n_episodes=n_episodes, deterministic=True)
         eval_env.close()
