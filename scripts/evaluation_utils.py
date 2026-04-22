@@ -118,6 +118,17 @@ def evaluate_policy_metrics(
         else:
             max_steps = 500 # Default fallback
             
+    # Significant-13: Fetch task-specific distances from env for accurate metrics
+    def get_env_attr(attr_name, default):
+        if hasattr(env, attr_name):
+            return getattr(env, attr_name)
+        elif hasattr(env, "get_attr"):
+            return env.get_attr(attr_name)[0]
+        return default
+
+    grasp_dist = get_env_attr("grasp_distance", 0.25)
+    goal_dist = get_env_attr("at_goal_distance", 0.40)
+            
     successes = 0
     grasps = 0
     at_goals = 0
@@ -170,11 +181,11 @@ def evaluate_policy_metrics(
             if not grasped and gripper_closed:
                 # Check if actually holding the part
                 dist_p = float(current_obs[DIST_TO_PART])
-                if dist_p < 0.1: # Use same threshold as env
+                if dist_p < grasp_dist: 
                     grasped = True
                     grasps += 1
 
-            if grasped and not at_goal and float(current_obs[DIST_TO_GOAL]) < 0.4:
+            if grasped and not at_goal and float(current_obs[DIST_TO_GOAL]) < goal_dist:
                 at_goal = True
                 at_goals += 1
 
