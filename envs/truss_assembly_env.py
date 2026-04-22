@@ -734,7 +734,7 @@ class TrussAssemblyEnv(gym.Env):
                 # Bug 7: Cap escalating reward to prevent PPO value spike
                 reward += min(1.0 * self.station_keeping_steps, 5.0)
                 if self.station_keeping_steps >= 20:  # ~0.4s of success
-                    reward += SUCCESS_BONUS / 4.0  # Normalized bonus
+                    reward += SUCCESS_BONUS  # Consistent bonus across stages
                     info["success"] = True
             else:
                 self.station_keeping_steps = 0
