@@ -125,14 +125,17 @@ class SuccessRateCallback(BaseCallback):
 
 def make_env(stage, max_steps, control_mode="joint"):
     """Create environment factory."""
+    from scripts.evaluation_utils import MomentumMonitor
     def _init():
         env = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps, control_mode=control_mode)
+        env = MomentumMonitor(env)
         return Monitor(
             env,
             info_keywords=(
                 "success",
                 "dropped_early",
                 "H_sys_norm",
+                "episode_max_momentum",
                 "momentum_controlled_release",
                 "high_momentum_release",
             ),
@@ -243,6 +246,7 @@ def run_curriculum(
         stage_start_time = datetime.now()
         total_trained = 0
         best_success_rate = 0.0
+        consecutive_successes = 0
         
         while total_trained < config['max_timesteps']:
             # Train in chunks
@@ -268,7 +272,13 @@ def run_curriculum(
                 model.save(f"{save_dir}/stage{stage}_best_model")
             
             # Check if threshold reached
-            if success_rate >= config['success_threshold'] and total_trained >= config['min_timesteps']:
+            if success_rate >= config['success_threshold']:
+                consecutive_successes += 1
+                print(f"  Consecutive evaluations meeting threshold: {consecutive_successes}/2")
+            else:
+                consecutive_successes = 0
+                
+            if consecutive_successes >= 2 and total_trained >= config['min_timesteps']:
                 print(f"\n  ✅ Stage {stage} COMPLETE! Success rate: {success_rate*100:.1f}%")
                 break
         else:

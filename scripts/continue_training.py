@@ -79,6 +79,9 @@ def continue_training(
     if learning_rate:
         print(f"Adjusting learning rate: {model.learning_rate} → {learning_rate}")
         model.learning_rate = learning_rate
+        # Fix BUG-3: Update the underlying Adam optimizer
+        for param_group in model.policy.optimizer.param_groups:
+            param_group["lr"] = learning_rate
     
     # Initial evaluation
     initial_success = evaluate(model, stage, max_steps)

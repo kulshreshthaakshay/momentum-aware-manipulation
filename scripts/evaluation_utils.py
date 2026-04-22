@@ -11,17 +11,38 @@ from typing import Any, Dict
 import numpy as np
 
 
-ROBOT_POS = slice(0, 3)
-ROBOT_LIN_VEL = slice(7, 10)
-ROBOT_ANG_VEL = slice(10, 13)
-EE_TO_PART = slice(27, 30)    # Relative: part_pos - ee_pos
-PART_TO_GOAL = slice(30, 33)  # Relative: goal_pos - part_pos
-BASE_TO_EE = slice(33, 36)    # Relative: ee_pos - robot_pos
-GRIPPER_STATE = 36
-DIST_TO_PART = 40
-DIST_TO_GOAL = 41
-H_SYS = slice(42, 45)
-H_SYS_NORM = 45
+import gymnasium as gym
+
+# 40D Observation Layout (post-refactor translation-invariant)
+ROBOT_ORN = slice(0, 4)
+ROBOT_LIN_VEL = slice(4, 7)
+ROBOT_ANG_VEL = slice(7, 10)
+EE_TO_PART = slice(24, 27)
+PART_TO_GOAL = slice(27, 30)
+GRIPPER_STATE = 30
+CONTACT_FORCE = slice(31, 34)
+DIST_TO_PART = 34
+DIST_TO_GOAL = 35
+H_SYS = slice(36, 39)
+H_SYS_NORM = 39
+
+class MomentumMonitor(gym.Wrapper):
+    """Tracks maximum momentum across an episode and logs it into info."""
+    def __init__(self, env):
+        super().__init__(env)
+        self.max_momentum = 0.0
+        
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.max_momentum = info.get("H_sys_norm", 0.0)
+        return obs, info
+        
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.max_momentum = max(self.max_momentum, info.get("H_sys_norm", 0.0))
+        if terminated or truncated:
+            info["episode_max_momentum"] = self.max_momentum
+        return obs, reward, terminated, truncated, info
 
 
 @dataclass
