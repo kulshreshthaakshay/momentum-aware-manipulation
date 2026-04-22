@@ -13,18 +13,20 @@ import numpy as np
 
 import gymnasium as gym
 
+from envs.truss_assembly_env import OBS_LAYOUT
+
 # 40D Observation Layout (post-refactor translation-invariant)
-ROBOT_ORN = slice(0, 4)
-ROBOT_LIN_VEL = slice(4, 7)
-ROBOT_ANG_VEL = slice(7, 10)
-EE_TO_PART = slice(24, 27)
-PART_TO_GOAL = slice(27, 30)
-GRIPPER_STATE = 30
-CONTACT_FORCE = slice(31, 34)
-DIST_TO_PART = 34
-DIST_TO_GOAL = 35
-H_SYS = slice(36, 39)
-H_SYS_NORM = 39
+ROBOT_ORN = slice(*OBS_LAYOUT["robot_orn"])
+ROBOT_LIN_VEL = slice(*OBS_LAYOUT["robot_lin_vel"])
+ROBOT_ANG_VEL = slice(*OBS_LAYOUT["robot_ang_vel"])
+EE_TO_PART = slice(*OBS_LAYOUT["ee_to_part"])
+PART_TO_GOAL = slice(*OBS_LAYOUT["part_to_goal"])
+GRIPPER_STATE = OBS_LAYOUT["gripper_state"][0]
+CONTACT_FORCE = slice(*OBS_LAYOUT["contact_force"])
+DIST_TO_PART = OBS_LAYOUT["dist_to_part"][0]
+DIST_TO_GOAL = OBS_LAYOUT["dist_to_goal"][0]
+H_SYS = slice(*OBS_LAYOUT["h_sys"])
+H_SYS_NORM = OBS_LAYOUT["h_sys_norm"][0]
 
 class MomentumMonitor(gym.Wrapper):
     """Tracks maximum momentum across an episode and logs it into info."""
@@ -105,7 +107,17 @@ def evaluate_policy_metrics(
     env: Any,
     n_episodes: int = 50,
     deterministic: bool = True,
+    max_steps: int = None
 ) -> RolloutMetrics:
+    # Significant-12: Use passed max_steps or detect from env
+    if max_steps is None:
+        if hasattr(env, "max_steps"):
+            max_steps = env.max_steps
+        elif hasattr(env, "get_attr"):
+            max_steps = env.get_attr("max_steps")[0]
+        else:
+            max_steps = 500 # Default fallback
+            
     successes = 0
     grasps = 0
     at_goals = 0
@@ -119,25 +131,50 @@ def evaluate_policy_metrics(
     max_momenta = []
 
     for _ in range(n_episodes):
-        obs, _ = env.reset()
+        reset_res = env.reset()
+        if isinstance(reset_res, tuple):
+            obs, _ = reset_res
+        else:
+            obs = reset_res
+        
+        # Handle batched observations from VecEnv
+        is_batched = (obs.ndim > 1)
+        
         episode_reward = 0.0
         grasped = False
         at_goal = False
         released = False
-        max_h = float(obs[H_SYS_NORM])
+        
+        current_obs = obs[0] if is_batched else obs
+        max_h = float(current_obs[H_SYS_NORM])
 
-        for step in range(env.max_steps):
+        for step_idx in range(max_steps):
             action, _ = model.predict(obs, deterministic=deterministic)
-            obs, reward, terminated, truncated, info = env.step(action)
+            step_res = env.step(action)
+            
+            # Unpack step results (tuple of 5 or 4 depending on VecEnv)
+            if len(step_res) == 5:
+                obs, reward, terminated, truncated, info = step_res
+                done = terminated or truncated
+                info = info
+            else:
+                obs, reward, done, info = step_res
+                info = info[0] # VecEnv returns list of infos
+                reward = reward[0]
+            
             episode_reward += reward
-            max_h = max(max_h, float(obs[H_SYS_NORM]))
+            current_obs = obs[0] if is_batched else obs
+            max_h = max(max_h, float(current_obs[H_SYS_NORM]))
 
-            gripper_closed = bool(obs[GRIPPER_STATE] > 0.5)
+            gripper_closed = bool(current_obs[GRIPPER_STATE] > 0.5)
             if not grasped and gripper_closed:
-                grasped = True
-                grasps += 1
+                # Check if actually holding the part
+                dist_p = float(current_obs[DIST_TO_PART])
+                if dist_p < 0.1: # Use same threshold as env
+                    grasped = True
+                    grasps += 1
 
-            if grasped and not at_goal and float(obs[DIST_TO_GOAL]) < getattr(env, "at_goal_distance", 0.4):
+            if grasped and not at_goal and float(current_obs[DIST_TO_GOAL]) < 0.4:
                 at_goal = True
                 at_goals += 1
 
@@ -152,18 +189,20 @@ def evaluate_policy_metrics(
 
             if info.get("success", False):
                 successes += 1
-                lengths.append(step + 1)
+                lengths.append(step_idx + 1)
                 break
 
-            if terminated or truncated:
+            if done:
                 if info.get("dropped_early", False):
                     early_drops += 1
                 elif not info.get("success", False):
-                    timeouts += 1  # Fix 7.2: count timeouts here, not in unreachable else
-                lengths.append(step + 1)
+                    timeouts += 1
+                lengths.append(step_idx + 1)
                 break
         else:
-            # Fallback: loop exhausted without break (shouldn't happen normally)
+            # Loop ended without break
+            lengths.append(max_steps)
+            timeouts += 1
             timeouts += 1
             lengths.append(env.max_steps)
 

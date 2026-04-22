@@ -11,7 +11,8 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from envs.truss_assembly_env import TrussAssemblyEnv
-from scripts.evaluation_utils import H_SYS_NORM, print_metrics, evaluate_policy_metrics
+from scripts.evaluation_utils import print_metrics, evaluate_policy_metrics
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 def evaluate(args):
     print(f"Loading model from: {args.model_path}")
@@ -25,6 +26,18 @@ def evaluate(args):
         model = PPO.load(args.model_path)
     else:
         model = SAC.load(args.model_path)
+
+    # Critical-2: Load and apply normalization stats
+    stats_path = args.model_path.replace(".zip", "_vecnorm.pkl")
+    if os.path.exists(stats_path):
+        print(f"Loading normalization stats from: {stats_path}")
+        # Create a dummy vec env to wrap for normalization
+        venv = DummyVecEnv([lambda: env])
+        env = VecNormalize.load(stats_path, venv)
+        env.training = False
+        env.norm_reward = False
+    else:
+        print("Warning: No normalization stats found. Evaluation may be inaccurate.")
     
     n_episodes = args.episodes
     print(f"\nEvaluating for {n_episodes} episodes...")

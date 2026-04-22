@@ -11,6 +11,28 @@ import gymnasium as gym
 from gymnasium import spaces
 
 
+# Observation Layout for consistent slicing across scripts
+OBS_LAYOUT = {
+    "robot_orn":    (0,  4),
+    "robot_lin_vel":(4,  7),
+    "robot_ang_vel":(7,  10),
+    "joint_pos":    (10, 17),
+    "joint_vel":    (17, 24),
+    "ee_to_part":   (24, 27),
+    "part_to_goal": (27, 30),
+    "gripper_state":(30, 31),
+    "contact_force":(31, 34),
+    "dist_to_part": (34, 35),
+    "dist_to_goal": (35, 36),
+    "h_sys":        (36, 39),
+    "h_sys_norm":   (39, 40),
+}
+
+# Reward Constants
+SUCCESS_BONUS = 200.0
+MILESTONE_BONUS = 50.0
+
+
 class TrussAssemblyEnv(gym.Env):
     """
     A free-flying robot with a manipulator arm assembling truss structures.
@@ -36,6 +58,11 @@ class TrussAssemblyEnv(gym.Env):
         self.max_thrust = 80.0  # Scaled for 60kg (was 20N for 15kg) -> ~1.33 m/s^2 accel
         self.max_torque = 8.0   # Scaled for larger inertia (was 2N)
         self.max_arm_vel = 1.0
+        
+        # Significant-8: Separate scaling for Task-Space velocities
+        self.max_ee_linear_vel = 0.5   # m/s
+        self.max_ee_angular_vel = 1.0  # rad/s
+        
         
         # Fix 2: Gripper threshold (use 0.3 instead of 0 for clearer signal)
         self.gripper_threshold = 0.3
@@ -132,6 +159,8 @@ class TrussAssemblyEnv(gym.Env):
         # Fix 2.4: Station keeping sustained success counter
         self.station_keeping_steps = 0
         self._prev_gripper_closed = False  # Track for transition logic
+        self.part_dropped_early = False    # Track for Stage 5 recovery path
+        
         
         # Initial cached momentum for observation
         self._cached_H_sys = self._compute_system_angular_momentum()
@@ -152,6 +181,11 @@ class TrussAssemblyEnv(gym.Env):
         else:
             init_pos = self.np_random.uniform(-0.3, 0.3, size=3).tolist()
             
+        # Minor-14: Randomize initial robot position for generalization
+        if self.curriculum_stage >= 3:
+            jitter = self.np_random.uniform(-0.2, 0.2, size=3).tolist()
+            init_pos = [init_pos[i] + jitter[i] for i in range(3)]
+
         # Load URDF
         urdf_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "zero_g_servicer.urdf")
         self.robot_id = p.loadURDF(
@@ -187,8 +221,9 @@ class TrussAssemblyEnv(gym.Env):
         for i in range(p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)):
             p.changeDynamics(self.robot_id, i, linearDamping=0.0, angularDamping=0.0, jointDamping=0.0, physicsClientId=self.physics_client)
         
-        # Fix 5.2: Use finger_left link for EE reference (actual fingertip)
-        self.ee_link_idx = 7
+        # Significant-9: Reference wrist_link_2 (idx 6) for symmetric gripper base
+        # This eliminates the 2cm lateral bias from finger_left (idx 7).
+        self.ee_link_idx = 6
         
         # Cache joint limits from URDF for proximity penalty
         self.joint_limits = []
@@ -217,13 +252,17 @@ class TrussAssemblyEnv(gym.Env):
         elif self.curriculum_stage <= 4:
             part_pos = [0.8, 0.0, 0.0]
         elif self.curriculum_stage == 5:
-            # Adjusted for new arm workspace
-            # Arm ready pose reaches out ~0.4m. Base at 1.0. EE at ~1.4.
+            # Minor-13 Fix: Corrected workspace target for full assembly
             part_pos = [1.6, 0.0, 0.0] 
         else:
             part_pos = self.np_random.uniform(1.0, 1.5, size=3)
             part_pos[1:] = self.np_random.uniform(-0.3, 0.3, size=2)
         
+        # Minor-14: Bounded randomization for part position generalization
+        if self.curriculum_stage >= 3:
+            jitter = self.np_random.uniform(-0.1, 0.1, size=3)
+            part_pos = np.array(part_pos) + jitter
+
         self.part_id = p.createMultiBody(
             baseMass=0.5,
             baseCollisionShapeIndex=part_col,
@@ -235,7 +274,8 @@ class TrussAssemblyEnv(gym.Env):
         
         p.changeDynamics(self.part_id, -1, linearDamping=0.0, angularDamping=0.0, physicsClientId=self.physics_client)
         
-        if self.curriculum_stage > 3:
+        # Minor-13: Move part velocity initialization to correct progression (Stage 4+)
+        if self.curriculum_stage >= 4:
             rand_vel = self.np_random.uniform(-0.1, 0.1, size=3).tolist()
             p.resetBaseVelocity(self.part_id, rand_vel, [0, 0, 0], physicsClientId=self.physics_client)
     
@@ -268,11 +308,13 @@ class TrussAssemblyEnv(gym.Env):
             # 13 dims: 6 base + 6 EE + 1 Gripper
             thrust = action[:3] * self.max_thrust
             torque = action[3:6] * self.max_torque
-            arm_vel = action[6:12] * self.max_arm_vel # 6 cartesian dims
+            
+            # Significant-8: Separate scaling for Task-Space velocities (m/s vs rad/s)
+            arm_vel = np.concatenate([
+                action[6:9]  * self.max_ee_linear_vel,
+                action[9:12] * self.max_ee_angular_vel
+            ])
             gripper_action = action[12]
-            
-            # Note: arm_vel is used later inside loop for Jacobian calc
-            
         else:
             # 14 dims: 6 base + 7 joint + 1 Gripper
             thrust = action[:3] * self.max_thrust
@@ -291,11 +333,15 @@ class TrussAssemblyEnv(gym.Env):
             
         if self.control_mode == "task_space":
             # --- TASK SPACE CONTROL (NULL SPACE PROJECTION) ---
-            # Computed ONCE per policy step
-            joint_states = p.getJointStates(self.robot_id, self._movable_indices, physicsClientId=self.physics_client)
-            q_movable = [s[0] for s in joint_states]
-            dq_movable = [s[1] for s in joint_states]
-            zero_acc = [0.0] * len(self._movable_indices)
+            # Significant-10: Consolidate joint state fetching and FK completeness
+            arm_joint_states = p.getJointStates(self.robot_id, self.arm_indices, physicsClientId=self.physics_client)
+            q_arm  = [s[0] for s in arm_joint_states]
+            dq_arm = np.array([s[1] for s in arm_joint_states])
+            
+            grip_states = p.getJointStates(self.robot_id, self.gripper_indices, physicsClientId=self.physics_client)
+            q_movable  = q_arm + [s[0] for s in grip_states]
+            dq_movable = list(dq_arm) + [s[1] for s in grip_states]
+            zero_acc   = [0.0] * len(q_movable)
             
             linear_jacobian, angular_jacobian = p.calculateJacobian(
                 self.robot_id, self.ee_link_idx, [0, 0, 0],
@@ -303,6 +349,7 @@ class TrussAssemblyEnv(gym.Env):
                 physicsClientId=self.physics_client
             )
             
+            # Slice to only the arm joints (redundant joints removed from calculation)
             linear_jacobian = np.array(linear_jacobian)[:, :len(self.arm_indices)]
             angular_jacobian = np.array(angular_jacobian)[:, :len(self.arm_indices)]
             J = np.vstack([linear_jacobian, angular_jacobian])
@@ -553,14 +600,20 @@ class TrussAssemblyEnv(gym.Env):
         gripper_state = float(self.gripper_closed)
 
         # Contact force (3-axis measurement)
+        # Critical-3: Constraint reaction forces provide haptic feedback when held
         contact_force = [0.0, 0.0, 0.0]
         if self.gripper_closed and self.gripper_constraint is not None:
+            # getConstraintState returns [Fx, Fy, Fz, Tx, Ty, Tz] in world frame
+            constraint_state = p.getConstraintState(self.gripper_constraint, physicsClientId=self.physics_client)
+            contact_force = list(constraint_state[:3])  # [Fx, Fy, Fz]
+        elif self.gripper_closed:
+            # Fallback if constraint not yet formed but gripper is closing
             contact_points = p.getContactPoints(self.robot_id, self.part_id, self.ee_link_idx, -1, physicsClientId=self.physics_client)
             if contact_points:
                 total_force = np.zeros(3)
                 for cp in contact_points:
-                    normal = np.array(cp[7])           # contact normal direction (world frame)
-                    force_magnitude = cp[9]            # normal force magnitude
+                    normal = np.array(cp[7])
+                    force_magnitude = cp[9]
                     total_force += force_magnitude * normal
                 contact_force = total_force.tolist()
 
@@ -654,7 +707,7 @@ class TrussAssemblyEnv(gym.Env):
                 # Bug 7: Cap escalating reward to prevent PPO value spike
                 reward += min(1.0 * self.station_keeping_steps, 5.0)
                 if self.station_keeping_steps >= 20:  # ~0.4s of success
-                    reward += 50.0  # Reduced bonus to avoid spike
+                    reward += SUCCESS_BONUS / 4.0  # Normalized bonus
                     info["success"] = True
             else:
                 self.station_keeping_steps = 0
@@ -684,7 +737,7 @@ class TrussAssemblyEnv(gym.Env):
             
             # Success condition
             if dist_to_part < self.grasp_distance:
-                reward += 200.0  # Increased success reward
+                reward += SUCCESS_BONUS
                 info["success"] = True
         
         elif self.curriculum_stage == 3:
@@ -728,11 +781,11 @@ class TrussAssemblyEnv(gym.Env):
                 self.grasp_hold_steps += 1
                 # Fix: Milestone bonus for first grasp (crucial for learning)
                 if not self.milestone_first_grasp:
-                    reward += 200.0  # Milestone bonus!
+                    reward += MILESTONE_BONUS
                     self.milestone_first_grasp = True
                 
                 if self.grasp_hold_steps >= 5:  # Hold for 5 consecutive steps
-                    reward += 500.0  # Success reward
+                    reward += SUCCESS_BONUS
                     info["success"] = True
             else:
                 self.grasp_hold_steps = 0
@@ -772,7 +825,7 @@ class TrussAssemblyEnv(gym.Env):
                 
                 # Fix: Milestone bonus for first grasp (require 3 holds)
                 if not self.milestone_first_grasp and self.grasp_hold_steps >= 3:
-                    reward += 200.0  # Milestone bonus!
+                    reward += MILESTONE_BONUS
                     self.milestone_first_grasp = True
                     # Fix 6.2: Reset prev_dist_to_goal at grasp transition
                     self.prev_dist_to_goal = dist_part_to_goal
@@ -803,7 +856,7 @@ class TrussAssemblyEnv(gym.Env):
                     
                     # Success: reached goal with part
                     if dist_part_to_goal < self.stage4_success_distance:
-                        reward += 500.0
+                        reward += SUCCESS_BONUS
                         info["success"] = True
         
         else:  # Stage 5: Full assembly sequence (approach → grasp → transport → release)
@@ -845,11 +898,11 @@ class TrussAssemblyEnv(gym.Env):
                         self.grasp_hold_steps += 1
                         # Fix 4: First grasp milestone bonus (require 3 holds)
                         if not self.milestone_first_grasp and self.grasp_hold_steps >= 3:
-                            reward += 200.0  # ONE-TIME bonus for first grasp!
+                            reward += MILESTONE_BONUS
                             self.milestone_first_grasp = True
                             self.prev_dist_to_goal = dist_part_to_goal
                         elif self.milestone_first_grasp:
-                            reward += 50.0  # Regular grasp bonus
+                            reward += 20.0  # Regular grasp bonus
                     else:
                         reward -= 2.0  # Penalty for being close but not grasping
                         reward += 2.0 * max(0.0, gripper_cmd)
@@ -909,18 +962,20 @@ class TrussAssemblyEnv(gym.Env):
                 if dist_part_to_goal < self.release_distance:
                     # SUCCESS! Give massive reward
                     H_release = H_sys_norm
-                    release_bonus = 500.0
+                    release_bonus = SUCCESS_BONUS
                     if H_release < 0.2:
-                        release_bonus += 100.0
+                        reward += MILESTONE_BONUS # Momentum bonus
                         info["momentum_controlled_release"] = True
                     elif H_release > 0.5:
-                        release_bonus -= 100.0
+                        reward -= MILESTONE_BONUS # High momentum penalty
                         info["high_momentum_release"] = True
                     reward += release_bonus
                     info["success"] = True
                 else:
-                    # Released but not at goal - BAD! Penalize dropping early
-                    reward -= 100.0
+                    # Critical-4: Allow re-grasp instead of terminal punishment loop
+                    reward -= 20.0 # Recoverable penalty
+                    self.grasped_part = False
+                    self.milestone_first_grasp = False
                     info["dropped_early"] = True
             
             # NOTE: Global momentum penalty (0.01 * |H_sys|) is already applied at line 608.
