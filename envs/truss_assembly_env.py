@@ -26,6 +26,7 @@ OBS_LAYOUT = {
     "dist_to_goal": (35, 36),
     "h_sys":        (36, 39),
     "h_sys_norm":   (39, 40),
+    "robot_pos":    (40, 43), # For Stage 1 station keeping
 }
 
 # Reward Constants
@@ -85,11 +86,12 @@ class TrussAssemblyEnv(gym.Env):
         # Contact (3): contact_force(3)
         # Distances (2): dist_part(1), dist_goal(1)
         # Momentum (4): H_sys(3), ||H_sys||(1)
-        # Total = 10 + 14 + 6 + 1 + 3 + 2 + 4 = 40
+        # Absolute (3): robot_pos(3) - Stage 1 only
+        # Total = 10 + 14 + 6 + 1 + 3 + 2 + 4 + 3 = 43
         
         self.num_arm_joints = 7
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(40,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(43,), dtype=np.float32
         )
         
         # Action space
@@ -625,20 +627,30 @@ class TrussAssemblyEnv(gym.Env):
         dist_to_part = np.linalg.norm(ee_to_part)
         dist_part_to_goal = np.linalg.norm(part_to_goal)
 
-        # Fix 3.1: Replace absolute robot_pos and base_to_ee with zeros or remove them for translation-invariant transfer.
-        # The relative vectors (ee_to_part, part_to_goal) already encode
-        # all spatial information needed. Absolute position hurts curriculum transfer.
-        obs = np.array(
-            list(robot_orn) + list(robot_lin_vel) + list(robot_ang_vel) +
-            list(joint_pos) + list(joint_vel) +
-            list(ee_to_part) +
-            list(part_to_goal) +
-            [gripper_state] +
-            list(contact_force) +
-            [dist_to_part, dist_part_to_goal] +
-            list(self._cached_H_sys) + [self._cached_H_sys_norm],
-            dtype=np.float32
-        )
+        # Stage 1 visibility: Include absolute position for station keeping
+        # BUG-6 Fix: Gate absolute pos by stage (normed by ~workspace radius)
+        if self.curriculum_stage == 1:
+            robot_pos, _ = p.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.physics_client)
+            robot_pos_obs = np.clip(np.array(robot_pos) / 5.0, -1.0, 1.0)
+        else:
+            robot_pos_obs = np.zeros(3)
+
+        obs = np.concatenate([
+            robot_orn,
+            robot_lin_vel,
+            robot_ang_vel,
+            joint_pos,
+            joint_vel,
+            ee_to_part,
+            part_to_goal,
+            [gripper_state],
+            contact_force,
+            [dist_to_part, dist_part_to_goal],
+            self._cached_H_sys,
+            [self._cached_H_sys_norm],
+            robot_pos_obs
+        ]).astype(np.float32)
+        
         return obs
     
     def _compute_reward(self, action):
