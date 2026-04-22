@@ -57,36 +57,38 @@ def evaluate(args):
         print(f"\nCapturing GIF of best episode...")
         best_episode_reward = -np.inf
         best_episode_frames = []
+        
+        gif_env = TrussAssemblyEnv(render_mode="rgb_array", curriculum_stage=args.stage, control_mode=args.control_mode)
+        gif_venv = DummyVecEnv([lambda: gif_env])
+        if os.path.exists(stats_path):
+            gif_venv = VecNormalize.load(stats_path, gif_venv)
+            gif_venv.training = False
+            gif_venv.norm_reward = False
+
         for i in range(min(n_episodes, 5)):  # Limit GIF candidates to 5
-            reset_res = env.reset()
-            if isinstance(reset_res, tuple):
-                obs, _ = reset_res
-            else:
-                obs = reset_res
+            obs = gif_venv.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
             
             done = False
-            truncated = False
             episode_reward = 0
             frames = []
             
-            while not (done or truncated):
+            while not done:
                 action, _ = model.predict(obs, deterministic=True)
-                step_res = env.step(action)
+                step_res = gif_venv.step(action)
                 
-                # Handle VecEnv vs Gym Env return signature
                 if len(step_res) == 5:
-                    obs, reward, done, truncated, info = step_res
+                    obs, reward, terminated, truncated, info = step_res
+                    done = bool(terminated[0] if hasattr(terminated, '__len__') else terminated) or bool(truncated[0] if hasattr(truncated, '__len__') else truncated)
+                    reward = float(reward[0] if hasattr(reward, '__len__') else reward)
                 else:
-                    obs, reward, done, info = step_res
-                    truncated = done # VecEnv combines them
-                    info = info[0] # VecEnv returns list of dicts
-                    reward = reward[0]
-                    done = done[0]
-                    truncated = truncated[0]
+                    obs, reward, done_arr, info = step_res
+                    done = bool(done_arr[0] if hasattr(done_arr, '__len__') else done_arr)
+                    reward = float(reward[0] if hasattr(reward, '__len__') else reward)
                 
                 episode_reward += reward
-                # Use raw_env for rendering to bypass VecNormalize wrapper
-                frame = raw_env.render()
+                frame = gif_env.render()
                 frames.append(frame)
             
             if episode_reward > best_episode_reward:

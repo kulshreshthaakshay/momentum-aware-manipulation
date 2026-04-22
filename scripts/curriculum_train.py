@@ -65,7 +65,7 @@ STAGE_CONFIGS = {
         "success_threshold": 0.80,
         "min_timesteps": 100000,
         "max_timesteps": 400000,
-        "gamma": 0.998,
+        "gamma": 0.995,
         "ent_coef": 0.01,
     },
     5: {
@@ -74,7 +74,7 @@ STAGE_CONFIGS = {
         "success_threshold": 0.75,
         "min_timesteps": 200000,
         "max_timesteps": 1000000,
-        "gamma": 0.999,
+        "gamma": 0.997,
         "ent_coef": 0.005,
     },
 }
@@ -84,9 +84,9 @@ PPO_CONFIG = {
     "learning_rate": 2e-4,
     "n_steps": 2048,
     "batch_size": 256,
-    "n_epochs": 10,   # Significant-6: Reduced from 15 to 10
+    "n_epochs": 4,    # Reduced from 10
     "gae_lambda": 0.97,
-    "clip_range": 0.3,
+    "clip_range": 0.2,
     "vf_coef": 0.5,   # Significant-6: Increased from 0.25 to 0.5
     "max_grad_norm": 0.5,
     "policy_kwargs": {"net_arch": [512, 256, 128]}
@@ -130,6 +130,16 @@ class SuccessRateCallback(BaseCallback):
             return self.success_rates[-1]
         return 0.0
 
+class SyncNormCallback(BaseCallback):
+    def __init__(self, train_env, eval_env, verbose=0):
+        super().__init__(verbose)
+        self.train_env = train_env
+        self.eval_env = eval_env
+    def _on_step(self):
+        self.eval_env.obs_rms = self.train_env.obs_rms
+        self.eval_env.ret_rms = self.train_env.ret_rms
+        return True
+
 
 def make_env(stage, max_steps, control_mode="joint"):
     """Create environment factory."""
@@ -151,31 +161,17 @@ def make_env(stage, max_steps, control_mode="joint"):
     return _init
 
 
-def evaluate_stage(model, stage, max_steps, control_mode="joint", n_episodes=50):
-    """Evaluate model on a specific stage."""
-    # Critical-2: Wrap eval env with normalization stats from model
-    env = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps, control_mode=control_mode)
-    
-    # We need to wrap it to apply normalization stats for the policy to work
+def evaluate_stage(model, norm_eval_env, n_episodes=50):
+    """Accepts an already-normalized VecEnv with current stats."""
+    norm_eval_env.training = False
     if hasattr(model, "get_vec_normalize_env") and model.get_vec_normalize_env() is not None:
-        from stable_baselines3.common.vec_env import DummyVecEnv
         stats_env = model.get_vec_normalize_env()
-        # Create a dummy vec env to wrap the single eval env
-        eval_env = DummyVecEnv([lambda: env])
-        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
-        # Significant-12: Copy complete normalization state for accurate evaluation
-        eval_env.obs_rms = stats_env.obs_rms
-        eval_env.ret_rms = stats_env.ret_rms
-        eval_env.clip_obs = stats_env.clip_obs
-        eval_env.clip_reward = stats_env.clip_reward
+        norm_eval_env.obs_rms = stats_env.obs_rms
+        norm_eval_env.ret_rms = stats_env.ret_rms
+        norm_eval_env.clip_obs = stats_env.clip_obs
+        norm_eval_env.clip_reward = stats_env.clip_reward
         
-        metrics = evaluate_policy_metrics(model, eval_env, n_episodes=n_episodes, deterministic=True)
-        eval_env.close()
-    else:
-        metrics = evaluate_policy_metrics(model, env, n_episodes=n_episodes, deterministic=True)
-        env.close()
-    
-    return metrics
+    return evaluate_policy_metrics(model, norm_eval_env, n_episodes=n_episodes, deterministic=True)
 
 
 def run_curriculum(
@@ -201,6 +197,9 @@ def run_curriculum(
     print(f"Save Directory: {save_dir}")
     print("=" * 70)
     
+    assert (n_envs * PPO_CONFIG["n_steps"]) % PPO_CONFIG["batch_size"] == 0, \
+        f"n_envs={n_envs} * n_steps={PPO_CONFIG['n_steps']} not divisible by batch_size={PPO_CONFIG['batch_size']}"
+    
     curriculum_log = {
         "start_time": datetime.now().isoformat(),
         "stages": {}
@@ -220,13 +219,12 @@ def run_curriculum(
         print(f"  Max Timesteps: {config['max_timesteps']:,}")
         
         # Create environments for this stage
-        train_env = SubprocVecEnv([make_env(stage, config['max_steps'], control_mode) for _ in range(n_envs)])
+        raw_train_env = SubprocVecEnv([make_env(stage, config['max_steps'], control_mode) for _ in range(n_envs)])
         # Critical-2: Wrap with VecNormalize for stable learning
-        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+        train_env = VecNormalize(raw_train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
         
-        eval_env_raw = make_env(stage, config['max_steps'], control_mode)()
-        eval_env = Monitor(eval_env_raw)
-        eval_env = DummyVecEnv([lambda: eval_env])
+        _mon = make_env(stage, config['max_steps'], control_mode)()
+        eval_env = DummyVecEnv([lambda e=_mon: e])
         # Significant-12: Eval env must use VecNormalize with synced stats
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False, clip_obs=10.0)
         
@@ -238,7 +236,9 @@ def run_curriculum(
                 stats_path = continue_from.replace(".zip", "_vecnorm.pkl")
                 if os.path.exists(stats_path):
                     print(f"  Loading normalization stats from: {stats_path}")
-                    train_env = VecNormalize.load(stats_path, train_env)
+                    train_env = VecNormalize.load(stats_path, raw_train_env)
+                    train_env.training = True
+                    train_env.norm_reward = True
                 model = PPO.load(continue_from, env=train_env, device='cpu')
             else:
                 print("\n  Creating new model...")
@@ -287,17 +287,18 @@ def run_curriculum(
                     param_group['lr'] = new_lr
         
         # Fix 4.5: Validate buffer size is divisible by batch_size
-        assert (n_envs * PPO_CONFIG["n_steps"]) % PPO_CONFIG["batch_size"] == 0, \
-            f"n_envs={n_envs} * n_steps={PPO_CONFIG['n_steps']} not divisible by batch_size={PPO_CONFIG['batch_size']}"
+        # (Moved to top of run_curriculum)
         
         # Callbacks
         success_callback = SuccessRateCallback(check_freq=25000, verbose=verbose)
         # Fix 4.4: Use deterministic=False for early stages (stochastic exploration)
-        eval_deterministic = stage >= 4
+        eval_deterministic = stage >= 3
         
         # Significant-12: Sync eval env stats with train env before training starts
         eval_env.obs_rms = train_env.obs_rms
         eval_env.ret_rms = train_env.ret_rms
+        
+        sync_callback = SyncNormCallback(train_env, eval_env)
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=f"{save_dir}/stage{stage}_best",
@@ -322,7 +323,7 @@ def run_curriculum(
             
             model.learn(
                 total_timesteps=chunk_size,
-                callback=[success_callback, eval_callback],
+                callback=[success_callback, eval_callback, sync_callback],
                 progress_bar=True,
                 reset_num_timesteps=(total_trained == 0)
             )
@@ -340,14 +341,8 @@ def run_curriculum(
             
             # Evaluate
             # Critical-2: Evaluation needs the same normalization
-            # We create a temporary eval env and apply the training stats
-            eval_env_raw = TrussAssemblyEnv(curriculum_stage=stage, max_steps=config['max_steps'], control_mode=control_mode)
-            # We don't wrap in VecNormalize for evaluate_stage if it expects raw obs, 
-            # but usually we SHOULD use normalized obs for prediction.
-            # evaluate_stage in curriculum_train.py uses evaluate_policy_metrics which calls model.predict.
-            # model.predict handles normalization IF the model's env is a VecNormalize.
-            
-            metrics = evaluate_stage(model, stage, config['max_steps'], control_mode, n_episodes=50)
+            # We use eval_env directly which is synced via SyncNormCallback
+            metrics = evaluate_stage(model, eval_env, n_episodes=50)
             success_rate = metrics.success_rate
             print(f"\n  Evaluation: {success_rate*100:.1f}% success ({total_trained:,} timesteps)")
             print(f"  Mean max |H_sys|: {metrics.mean_max_momentum:.4f}")

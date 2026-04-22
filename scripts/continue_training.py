@@ -25,33 +25,33 @@ def make_env(stage, max_steps):
     return _init
 
 
-def evaluate(model, stage, max_steps, n_episodes=50):
+def evaluate(model, eval_env, n_episodes=50, max_steps=1000):
     """Quick evaluation."""
-    env = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps)
-    
-    # Bug-8: Apply normalization for evaluation if model has stats
-    if hasattr(model, "get_vec_normalize_env") and model.get_vec_normalize_env() is not None:
-        stats_env = model.get_vec_normalize_env()
-        eval_env = DummyVecEnv([lambda: env])
-        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
-        eval_env.obs_rms = stats_env.obs_rms
-        eval_env.ret_rms = stats_env.ret_rms
-        eval_env.clip_obs = stats_env.clip_obs
-    else:
-        eval_env = DummyVecEnv([lambda: env])
-        
     successes = 0
     for _ in range(n_episodes):
         obs = eval_env.reset()
-        for _ in range(max_steps):
+        if isinstance(obs, tuple):
+            obs = obs[0]
+            
+        done = False
+        steps = 0
+        while not done and steps < max_steps:
             action, _ = model.predict(obs, deterministic=False)
-            obs, _, done, info = eval_env.step(action)
-            if info[0].get('success'):
+            step_res = eval_env.step(action)
+            
+            if len(step_res) == 5:
+                obs, reward, terminated, truncated, info = step_res
+                done = bool(terminated[0] if hasattr(terminated, '__len__') else terminated) or bool(truncated[0] if hasattr(truncated, '__len__') else truncated)
+                info_dict = info[0] if isinstance(info, list) else info
+            else:
+                obs, reward, done_arr, info = step_res
+                done = bool(done_arr[0] if hasattr(done_arr, '__len__') else done_arr)
+                info_dict = info[0] if isinstance(info, list) else info
+                
+            if info_dict.get('success'):
                 successes += 1
                 break
-            if done:
-                break
-    eval_env.close()
+            steps += 1
     return successes / n_episodes * 100
 
 
@@ -81,13 +81,12 @@ def continue_training(
     print("=" * 70)
     
     # Create environments
-    train_env = SubprocVecEnv([make_env(stage, max_steps) for _ in range(n_envs)])
-    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    raw_env = SubprocVecEnv([make_env(stage, max_steps) for _ in range(n_envs)])
+    train_env = VecNormalize(raw_env, norm_obs=True, norm_reward=True)
     
     # Evaluator needs Monitor for stats
     eval_env_raw = TrussAssemblyEnv(curriculum_stage=stage, max_steps=max_steps)
-    eval_env = Monitor(eval_env_raw)
-    eval_env = DummyVecEnv([lambda: eval_env])
+    eval_env = DummyVecEnv([lambda: eval_env_raw])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
     
     # Load model
@@ -97,7 +96,9 @@ def continue_training(
     stats_path = model_path.replace(".zip", "_vecnorm.pkl")
     if os.path.exists(stats_path):
         print(f"Loading normalization stats from: {stats_path}")
-        train_env = VecNormalize.load(stats_path, train_env)
+        train_env = VecNormalize.load(stats_path, raw_env)
+        train_env.training = True
+        train_env.norm_reward = True
         # Sync eval env stats
         eval_env.obs_rms = train_env.obs_rms
         eval_env.ret_rms = train_env.ret_rms
@@ -114,7 +115,7 @@ def continue_training(
             param_group["lr"] = learning_rate
     
     # Initial evaluation
-    initial_success = evaluate(model, stage, max_steps)
+    initial_success = evaluate(model, eval_env, max_steps=max_steps)
     print(f"\nInitial success rate: {initial_success:.1f}%")
     
     # Callbacks
@@ -144,7 +145,7 @@ def continue_training(
     )
     
     # Final evaluation
-    final_success = evaluate(model, stage, max_steps, n_episodes=100)
+    final_success = evaluate(model, eval_env, n_episodes=100, max_steps=max_steps)
     print(f"\nFinal success rate: {final_success:.1f}%")
     print(f"Improvement: {final_success - initial_success:+.1f}%")
     

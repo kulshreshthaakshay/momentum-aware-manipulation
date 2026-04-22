@@ -26,7 +26,6 @@ OBS_LAYOUT = {
     "dist_to_goal": (35, 36),
     "h_sys":        (36, 39),
     "h_sys_norm":   (39, 40),
-    "robot_pos":    (40, 43), # For Stage 1 station keeping
 }
 
 # Reward Constants
@@ -70,9 +69,9 @@ class TrussAssemblyEnv(gym.Env):
         
         # Fix 3: Increased grasp distance for easier discovery
         self.grasp_distance = 0.25  # Was 0.15
-        self.stage4_success_distance = 0.30
-        self.release_distance = 0.40
-        self.at_goal_distance = 0.40
+        self.stage4_success_distance = 0.35
+        self.release_distance = 0.35
+        self.at_goal_distance = 0.25
         
         # Track previous distance for shaping
         self.prev_dist_to_part = None
@@ -91,7 +90,7 @@ class TrussAssemblyEnv(gym.Env):
         
         self.num_arm_joints = 7
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(43,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(40,), dtype=np.float32
         )
         
         # Action space
@@ -115,15 +114,14 @@ class TrussAssemblyEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        if self.physics_client is not None:
-            p.disconnect(physicsClientId=self.physics_client)
-        
-        if self.render_mode == "human":
-            self.physics_client = p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0,
-                                       physicsClientId=self.physics_client)
+        if self.physics_client is None:
+            if self.render_mode == "human":
+                self.physics_client = p.connect(p.GUI)
+                p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.physics_client)
+            else:
+                self.physics_client = p.connect(p.DIRECT)
         else:
-            self.physics_client = p.connect(p.DIRECT)
+            p.resetSimulation(physicsClientId=self.physics_client)
         
         # Fix 1.3: Assert connection succeeded before proceeding
         assert self.physics_client >= 0, "PyBullet connection failed"
@@ -230,6 +228,7 @@ class TrussAssemblyEnv(gym.Env):
         # Significant-9: Reference wrist_link_2 (idx 6) for symmetric gripper base
         # This eliminates the 2cm lateral bias from finger_left (idx 7).
         self.ee_link_idx = 6
+        self.gripper_offset = np.array([0.085, 0.0, 0.0])  # local +X offset to finger midpoint
         
         # Cache joint limits from URDF for proximity penalty
         self.joint_limits = []
@@ -242,7 +241,7 @@ class TrussAssemblyEnv(gym.Env):
         # Cache movable joint indices (excludes FIXED joints)
         self._movable_indices = []
         for i in range(p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)):
-            if p.getJointInfo(self.robot_id, i, physicsClientId=self.physics_client)[2] != p.JOINT_FIXED:
+            if p.getJointInfo(self.robot_id, i, physicsClientId=self.physics_client)[2] != p.JOINT_FIXED and i not in self.gripper_indices:
                 self._movable_indices.append(i)
     
     def _create_part(self):
@@ -365,10 +364,15 @@ class TrussAssemblyEnv(gym.Env):
             
             arm_joint_states = p.getJointStates(self.robot_id, self.arm_indices,
                                                 physicsClientId=self.physics_client)
+            q_arm = np.array([s[0] for s in arm_joint_states])
             dq_arm = np.array([s[1] for s in arm_joint_states])
             
+            # Null-Space Secondary Task: Minimize Momentum by driving toward neutral posture
+            q_mid = np.array([(l + u) / 2.0 for l, u in self.joint_limits])
+            posture_gradient = -0.5 * (q_arm - q_mid)
+            
             null_projector = np.eye(7) - J_pinv @ J
-            target_joint_vels = J_pinv @ arm_vel + null_projector @ (-0.5 * dq_arm)
+            target_joint_vels = J_pinv @ arm_vel + null_projector @ posture_gradient
             
             p.setJointMotorControlArray(
                 self.robot_id, self.arm_indices,
@@ -377,6 +381,13 @@ class TrussAssemblyEnv(gym.Env):
                 forces=[100]*7,
                 physicsClientId=self.physics_client
             )
+            
+            # Base compensation feedforward
+            I_base_inv = np.eye(3) / 2.5
+            target_base_w = -I_base_inv @ (angular_jacobian @ target_joint_vels)
+            _, current_w = p.getBaseVelocity(self.robot_id, physicsClientId=self.physics_client)
+            comp_torque = 2.5 * (target_base_w - np.array(current_w)) / self.dt
+            torque += comp_torque
             
         # Action Repetition Loop
         for _ in range(self.sim_substeps):
@@ -433,8 +444,10 @@ class TrussAssemblyEnv(gym.Env):
         # 2. Logical Grasping (Constraint Injection)
         # Get EE State
         ee_state = p.getLinkState(self.robot_id, self.ee_link_idx, physicsClientId=self.physics_client)
-        ee_pos = np.array(ee_state[0])
-        ee_orn = ee_state[1]
+        ee_pos_world = np.array(ee_state[0])
+        ee_orn_world = ee_state[1]
+        R = np.array(p.getMatrixFromQuaternion(ee_orn_world)).reshape(3,3)
+        ee_pos = ee_pos_world + R @ self.gripper_offset
         
         part_pos, part_orn = p.getBasePositionAndOrientation(self.part_id, physicsClientId=self.physics_client)
         dist_to_part = np.linalg.norm(ee_pos - np.array(part_pos))
@@ -442,7 +455,7 @@ class TrussAssemblyEnv(gym.Env):
         if should_close and not self.gripper_closed and dist_to_part < self.grasp_distance:
             # Compute the actual relative transform between EE and part at grasp time.
             # This avoids the spring oscillation caused by a hardcoded offset mismatch.
-            ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn)
+            ee_inv_pos, ee_inv_orn = p.invertTransform(ee_pos.tolist(), ee_orn_world)
             local_pos, local_orn = p.multiplyTransforms(
                 ee_inv_pos, ee_inv_orn,
                 list(part_pos), list(part_orn)
@@ -590,7 +603,10 @@ class TrussAssemblyEnv(gym.Env):
 
         # End effector position (using link state)
         ee_state = p.getLinkState(self.robot_id, self.ee_link_idx, physicsClientId=self.physics_client)
-        ee_pos = np.array(ee_state[0])
+        ee_pos_world = np.array(ee_state[0])
+        ee_orn_world = ee_state[1]
+        R = np.array(p.getMatrixFromQuaternion(ee_orn_world)).reshape(3,3)
+        ee_pos = ee_pos_world + R @ self.gripper_offset
 
         # Part state
         part_pos, _ = p.getBasePositionAndOrientation(self.part_id, physicsClientId=self.physics_client)
@@ -623,18 +639,18 @@ class TrussAssemblyEnv(gym.Env):
                     force_magnitude = cp[9]
                     total_force += force_magnitude * normal
                 contact_force = total_force.tolist()
+                
+        max_contact_force = 100.0
+        contact_force = np.clip(contact_force, -max_contact_force, max_contact_force)
+        contact_force = (np.array(contact_force) / max_contact_force).tolist()
 
         # Distances
         dist_to_part = np.linalg.norm(ee_to_part)
         dist_part_to_goal = np.linalg.norm(part_to_goal)
 
-        # Stage 1 visibility: Include absolute position for station keeping
-        # BUG-6 Fix: Gate absolute pos by stage (normed by ~workspace radius)
-        if self.curriculum_stage == 1:
-            robot_pos, _ = p.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.physics_client)
-            robot_pos_obs = np.clip(np.array(robot_pos) / 5.0, -1.0, 1.0)
-        else:
-            robot_pos_obs = np.zeros(3)
+        H_scale = 5.0
+        h_obs = np.clip(self._cached_H_sys / H_scale, -3.0, 3.0)
+        h_norm_obs = np.clip(self._cached_H_sys_norm / H_scale, 0.0, 3.0)
 
         obs = np.concatenate([
             robot_orn,
@@ -647,9 +663,8 @@ class TrussAssemblyEnv(gym.Env):
             [gripper_state],
             contact_force,
             [dist_to_part, dist_part_to_goal],
-            self._cached_H_sys,
-            [self._cached_H_sys_norm],
-            robot_pos_obs
+            h_obs,
+            [h_norm_obs]
         ]).astype(np.float32)
         
         return obs
@@ -665,8 +680,14 @@ class TrussAssemblyEnv(gym.Env):
         
         # Calculate EE position (Dynamic from 7-DOF arm)
         ee_state = p.getLinkState(self.robot_id, self.ee_link_idx, computeLinkVelocity=1, physicsClientId=self.physics_client)
-        ee_pos = np.array(ee_state[0])
-        ee_vel = np.array(ee_state[6])
+        ee_pos_world = np.array(ee_state[0])
+        ee_orn_world = ee_state[1]
+        R = np.array(p.getMatrixFromQuaternion(ee_orn_world)).reshape(3,3)
+        ee_pos = ee_pos_world + R @ self.gripper_offset
+        
+        ee_vel_world = np.array(ee_state[6])
+        ee_omega = np.array(ee_state[7])
+        ee_vel = ee_vel_world + np.cross(ee_omega, R @ self.gripper_offset)
         part_vel, _ = p.getBaseVelocity(self.part_id, physicsClientId=self.physics_client)
         part_vel = np.array(part_vel)
         
@@ -700,8 +721,9 @@ class TrussAssemblyEnv(gym.Env):
         H_sys = self._cached_H_sys
         H_sys_norm = self._cached_H_sys_norm
         info["H_sys_norm"] = H_sys_norm
-        # Scale coherence fix: Boost momentum penalty to 0.1
-        momentum_penalty = 0.1 * H_sys_norm
+        
+        H_sys_norm_normalised = H_sys_norm / 5.0
+        momentum_penalty = 2.0 * (H_sys_norm_normalised ** 2)
         # H_sys_norm is now available for all stage blocks below (no re-computation)
         
         # Joint limit proximity penalty (smooth activation near URDF limits)
@@ -778,7 +800,7 @@ class TrussAssemblyEnv(gym.Env):
             if not self.gripper_closed:
                 # Progress reward for approaching
                 progress = self.prev_dist_to_part - dist_to_part
-                reward += 50.0 * progress  # Strong progress incentive
+                reward += 100.0 * progress  # Same as Stage 2
                 
                 # Velocity toward target (only when far)
                 if dist_to_part > self.grasp_distance:
@@ -854,8 +876,6 @@ class TrussAssemblyEnv(gym.Env):
                 if not self.milestone_first_grasp and self.grasp_hold_steps >= 3:
                     reward += MILESTONE_BONUS
                     self.milestone_first_grasp = True
-                    # Fix 6.2: Reset prev_dist_to_goal at grasp transition
-                    self.prev_dist_to_goal = dist_part_to_goal
                 
                 if not self.milestone_first_grasp:
                     pass # Waiting to stabilize grasp
@@ -928,7 +948,6 @@ class TrussAssemblyEnv(gym.Env):
                             reward += MILESTONE_BONUS
                             self.milestone_first_grasp_ever = True
                             self.milestone_first_grasp = True
-                            self.prev_dist_to_goal = dist_part_to_goal
                         elif self.milestone_first_grasp:
                             reward += 20.0  # Regular grasp bonus
                     else:
@@ -941,6 +960,9 @@ class TrussAssemblyEnv(gym.Env):
             
             # === PHASE 2: TRANSPORT TO GOAL ===
             elif self.gripper_closed:
+                if self.prev_dist_to_goal is None:
+                    self.prev_dist_to_goal = dist_part_to_goal
+                
                 # Progress toward goal
                 # Fix 2.2: Unified progress multiplier, clipped non-negative
                 goal_progress = self.prev_dist_to_goal - dist_part_to_goal
@@ -978,6 +1000,7 @@ class TrussAssemblyEnv(gym.Env):
                     if action[-1] < -0.3: # Threshold slightly below gripper_threshold
                         reward += 5.0
                     
+                    self.steps_at_goal_holding += 1
                     info["at_goal_holding"] = True
                 else:
                     # Clear flag if drifted out
@@ -1005,9 +1028,6 @@ class TrussAssemblyEnv(gym.Env):
                     self.milestone_first_grasp = False
                     self.milestone_reached_goal_area = False # Allow re-entering Phase 2
                     info["dropped_early"] = True
-            
-            # NOTE: Global momentum penalty (0.01 * |H_sys|) is already applied at line 608.
-            # A duplicate 0.02 penalty was removed here to avoid 3x stacking in Stage 5.
 
         info.setdefault("success", False)
         info.setdefault("dropped_early", False)

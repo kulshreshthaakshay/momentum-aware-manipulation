@@ -21,12 +21,12 @@ ROBOT_LIN_VEL = slice(*OBS_LAYOUT["robot_lin_vel"])
 ROBOT_ANG_VEL = slice(*OBS_LAYOUT["robot_ang_vel"])
 EE_TO_PART = slice(*OBS_LAYOUT["ee_to_part"])
 PART_TO_GOAL = slice(*OBS_LAYOUT["part_to_goal"])
-GRIPPER_STATE = OBS_LAYOUT["gripper_state"][0]
+GRIPPER_STATE = slice(*OBS_LAYOUT["gripper_state"])
 CONTACT_FORCE = slice(*OBS_LAYOUT["contact_force"])
-DIST_TO_PART = OBS_LAYOUT["dist_to_part"][0]
-DIST_TO_GOAL = OBS_LAYOUT["dist_to_goal"][0]
+DIST_TO_PART = slice(*OBS_LAYOUT["dist_to_part"])
+DIST_TO_GOAL = slice(*OBS_LAYOUT["dist_to_goal"])
 H_SYS = slice(*OBS_LAYOUT["h_sys"])
-H_SYS_NORM = OBS_LAYOUT["h_sys_norm"][0]
+H_SYS_NORM = slice(*OBS_LAYOUT["h_sys_norm"])
 
 class MomentumMonitor(gym.Wrapper):
     """Tracks maximum momentum across an episode and logs it into info."""
@@ -157,7 +157,7 @@ def evaluate_policy_metrics(
         released = False
         
         current_obs = obs[0] if is_batched else obs
-        max_h = float(current_obs[H_SYS_NORM])
+        max_h = float(current_obs[H_SYS_NORM][0])
 
         for step_idx in range(max_steps):
             action, _ = model.predict(obs, deterministic=deterministic)
@@ -166,26 +166,32 @@ def evaluate_policy_metrics(
             # Unpack step results (tuple of 5 or 4 depending on VecEnv)
             if len(step_res) == 5:
                 obs, reward, terminated, truncated, info = step_res
+                # VecEnv returns list[dict]; raw env returns dict
+                if isinstance(info, list):
+                    info = info[0]
+                    reward = float(reward[0]) if hasattr(reward, '__len__') else reward
+                    terminated = bool(terminated[0]) if hasattr(terminated, '__len__') else terminated
+                    truncated  = bool(truncated[0])  if hasattr(truncated,  '__len__') else truncated
                 done = terminated or truncated
-                info = info
             else:
                 obs, reward, done, info = step_res
-                info = info[0] # VecEnv returns list of infos
-                reward = reward[0]
+                info = info[0] if isinstance(info, list) else info
+                reward = float(reward[0]) if hasattr(reward, '__len__') else float(reward)
+                done = bool(done[0]) if hasattr(done, '__len__') else bool(done)
             
             episode_reward += reward
             current_obs = obs[0] if is_batched else obs
-            max_h = max(max_h, float(current_obs[H_SYS_NORM]))
+            max_h = max(max_h, float(current_obs[H_SYS_NORM][0]))
 
-            gripper_closed = bool(current_obs[GRIPPER_STATE] > 0.5)
+            gripper_closed = bool(current_obs[GRIPPER_STATE][0] > 0.5)
             if not grasped and gripper_closed:
                 # Check if actually holding the part
-                dist_p = float(current_obs[DIST_TO_PART])
+                dist_p = float(current_obs[DIST_TO_PART][0])
                 if dist_p < grasp_dist: 
                     grasped = True
                     grasps += 1
 
-            if grasped and not at_goal and float(current_obs[DIST_TO_GOAL]) < goal_dist:
+            if grasped and not at_goal and float(current_obs[DIST_TO_GOAL][0]) < goal_dist:
                 at_goal = True
                 at_goals += 1
 
